@@ -374,8 +374,8 @@ def main():
             print('Fails to extract embedding')
     elif args.task == 'embedding_kaldi':
         names, embeddings = model.extract_embedding_list(args.wav_scp)
-        embed_ark = args.output_file + ".ark"
-        embed_scp = args.output_file + ".scp"
+        embed_ark = os.path.abspath(args.output_file + ".ark")
+        embed_scp = os.path.abspath(args.output_file + ".scp")
         with kaldiio.WriteHelper('ark,scp:' + embed_ark + "," +
                                  embed_scp) as writer:
             for name, embedding in zip(names, embeddings):
