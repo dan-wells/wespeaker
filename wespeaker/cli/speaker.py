@@ -97,7 +97,7 @@ class Speaker:
                                window_type=self.window_type)  # [T, D]
             if cmn:
                 feat = feat - torch.mean(feat, dim=0)
-            feat = feat.unsqueeze(0)  # [1, T, D]
+            feat = feat.unsqueeze(0).to(self.device)  # [1, T, D]
         else:
             wavform_lens = torch.LongTensor([wavform.shape[1]]).repeat(
                 wavform.shape[0]).to(self.device)
