@@ -45,6 +45,9 @@ setup(
             "flake8",
             "pre-commit",
         ],
+        "meeting_sim": [
+            "pyroomacoustics",
+        ],
     },
     project_urls={
         "Homepage": "https://github.com/wenet-e2e/wespeaker",
@@ -55,6 +58,7 @@ setup(
     entry_points={
         "console_scripts": [
             "wespeaker=wespeaker.cli.speaker:main",
+            "wespeaker-meeting-sim=wespeaker.utils.meeting_sim.simulate:main",
         ],
     },
     packages=find_packages(include=["wespeaker*"]),

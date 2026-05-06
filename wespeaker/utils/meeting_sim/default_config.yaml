@@ -1,0 +1,73 @@
+resample_rate: 16000
+
+speakers:
+  n_speakers: 3
+  max_enrol_utts: null  # max utterances per speaker for mean embedding (null = use all)
+  similarity_mode: "similar-close-subgroup"
+  similar_subgroup_size: 2
+  fallback_strategy: "dissimilar"
+  similarity_thresh: 0.75
+  dissimilarity_thresh: 0.55
+  unique_across_meetings: false  # draw without replacement across meetings (random mode, n_workers=1 only)
+
+meeting:
+  duration_s: 300.0
+  pause_range: [0.2, 1.5]  # inter-turn pause range [min_s, max_s]
+  random_jump_rate: 0.3  # probability of jumping to a random speaker instead of round-robin
+  overlap_ratio: 0.15
+  min_overlap_anchor_dur_s: 1.0  # minimum turn duration (s) to be eligible for overlaps
+  allow_multi_overlap: true  # whether long turns can receive multiple overlapping interjections
+  overlap_weights:
+    backchannel: 0.3
+    competitive: 0.3
+    collaborative: 0.2
+    simultaneous: 0.2
+  segment_durations:
+    - range: [1.0, 3.0]
+      weight: 0.3
+    - range: [5.0, 10.0]
+      weight: 0.4
+    - range: [12.0, 20.0]
+      weight: 0.3
+  exchange_bursts:
+    n_bursts: 2
+    n_turns: [4, 8]
+    segment_range: [0.5, 2.0]
+    pause_range: [0.05, 0.3]
+    target_speakers: "similar-subgroup"  # or "random-pair"
+
+room:
+  length: 4.0
+  width: 3.0
+  height: 2.4
+  rt60: 0.4
+  speaker_position_jitter: 0.2  # meters, applied independently to each speaker's x/y/z
+  speaker_positions:
+    - [1.5, 1.0, 1.3]   # position 0: close
+    - [2.5, 1.0, 1.3]   # position 1: close
+    - [2.0, 2.0, 1.3]   # position 2: far
+
+array:
+  n_mics: 8
+  spacing: 0.04
+
+output:
+  channels: [mono]
+  save_reverberant: false
+  save_dry: false
+
+noise:
+  enabled: false
+  wav_path: null
+  snr_db: 30.0
+
+batch:
+  n_meetings: 10
+  seed: 42
+  n_workers: 1
+  vary:
+    room.length: 0.3
+    room.width: 0.3
+    room.rt60: 0.1
+    room.speaker_position_jitter: 0.05
+    meeting.overlap_ratio: 0.05
