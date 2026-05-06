@@ -28,18 +28,34 @@ def get_args():
     return args
 
 
-def read_rttm(rttm_file):
+def read_rttm(rttm_file, with_labels=False):
+    """Parse an RTTM file into segments grouped by utterance.
+
+    Args:
+      rttm_file: Path to the RTTM file.
+      with_labels: If True, include speaker labels in the output tuples.
+
+    Returns:
+      OrderedDict mapping utt_id to a sorted list of segment tuples.
+      If with_labels is False: list of (begin, end).
+      If with_labels is True: list of (begin, end, speaker_label).
+    """
     utt_to_segments = OrderedDict()
 
     for line in open(rttm_file, 'r'):
-        line = line.strip().split()
-        utt, begin, duration = line[1], line[3], line[4]
+        tokens = line.strip().split()
+        utt, begin, duration = tokens[1], tokens[3], tokens[4]
         begin = float(begin)
         end = begin + float(duration)
-        if utt not in utt_to_segments:
-            utt_to_segments[utt] = [(begin, end)]
+        if with_labels:
+            speaker = tokens[7]
+            entry = (begin, end, speaker)
         else:
-            utt_to_segments[utt].append((begin, end))
+            entry = (begin, end)
+        if utt not in utt_to_segments:
+            utt_to_segments[utt] = [entry]
+        else:
+            utt_to_segments[utt].append(entry)
 
     for utt in utt_to_segments.keys():
         utt_to_segments[utt].sort()
