@@ -2,7 +2,7 @@ resample_rate: 16000
 
 speakers:
   n_speakers: 3
-  max_enrol_utts: null  # max utterances per speaker for mean embedding (null = use all)
+  max_enroll_utts: null  # max utterances per speaker for mean embedding (null = use all)
   similarity_mode: "similar-close-subgroup"
   similar_subgroup_size: 2
   fallback_strategy: "dissimilar"

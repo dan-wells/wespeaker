@@ -68,7 +68,7 @@ class SpeakerPool:
 
 
 def build_speaker_pool(wav_scp, utt2spk, embedding_scp=None, model_dir=None,
-                       device='cpu', max_enrol_utts=None, seed=42):
+                       device='cpu', max_enroll_utts=None, seed=42):
     """Build a speaker pool from wav.scp and utt2spk files.
 
     Reads audio paths and speaker assignments, then either loads
@@ -84,7 +84,7 @@ def build_speaker_pool(wav_scp, utt2spk, embedding_scp=None, model_dir=None,
       model_dir: Path to pretrained wespeaker model directory. Required
         if embedding_scp is not provided.
       device: Device for embedding extraction ('cpu' or 'cuda:N').
-      max_enrol_utts: Maximum number of utterances to use per speaker
+      max_enroll_utts: Maximum number of utterances to use per speaker
         for mean embedding computation. If None, all utterances are
         used. When set, a random subset of this size is sampled per
         speaker (deterministically using seed).
@@ -119,9 +119,9 @@ def build_speaker_pool(wav_scp, utt2spk, embedding_scp=None, model_dir=None,
     spk_enrol_utts = {}
     for spk_id in speaker_ids:
         utts = spk_to_utts[spk_id]
-        if max_enrol_utts is not None and len(utts) > max_enrol_utts:
+        if max_enroll_utts is not None and len(utts) > max_enroll_utts:
             indices = rng.choice(
-                len(utts), size=max_enrol_utts, replace=False)
+                len(utts), size=max_enroll_utts, replace=False)
             spk_enrol_utts[spk_id] = [utts[i] for i in sorted(indices)]
         else:
             spk_enrol_utts[spk_id] = utts

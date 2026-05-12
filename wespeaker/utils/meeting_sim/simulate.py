@@ -19,6 +19,7 @@ import fire
 import numpy as np
 import yaml
 
+from wespeaker.utils.cli import validate_fire_args
 from wespeaker.utils.meeting_sim.speakers import (
     build_speaker_pool, cluster_speakers, compute_vad_segments,
     select_speakers, find_subgroup_positions,
@@ -311,7 +312,7 @@ class MeetingSimulator:
 
     def enroll(self, wav_scp, utt2spk, output_dir, embedding_scp=None,
               model_dir=None, device='cpu', config=None,
-              similarity_thresh=None, max_enrol_utts=None,
+              similarity_thresh=None, max_enroll_utts=None,
               precompute_vad=False, n_workers=None, seed=None):
         """Build speaker pool from audio files.
 
@@ -329,7 +330,7 @@ class MeetingSimulator:
           device: Device for embedding extraction.
           config: Path to YAML config file (uses default if not given).
           similarity_thresh: Threshold for clustering similar speakers.
-          max_enrol_utts: Maximum utterances per speaker for mean embedding.
+          max_enroll_utts: Maximum utterances per speaker for mean embedding.
           precompute_vad: Run VAD on all utterances and cache the segments in the pool.
           n_workers: Number of parallel workers for VAD computation.
           seed: Random seed. Overrides config batch.seed.
@@ -342,8 +343,8 @@ class MeetingSimulator:
 
         if similarity_thresh is None:
             similarity_thresh = speakers_cfg.get('similarity_thresh', 0.75)
-        if max_enrol_utts is None:
-            max_enrol_utts = speakers_cfg.get('max_enrol_utts')
+        if max_enroll_utts is None:
+            max_enroll_utts = speakers_cfg.get('max_enroll_utts')
         if n_workers is None:
             n_workers = batch_cfg.get('n_workers', 1)
         if seed is None:
@@ -355,7 +356,7 @@ class MeetingSimulator:
             embedding_scp=embedding_scp,
             model_dir=model_dir,
             device=device,
-            max_enrol_utts=max_enrol_utts,
+            max_enroll_utts=max_enroll_utts,
             seed=seed,
         )
 
@@ -827,6 +828,7 @@ def _write_metadata(metadata, output_dir):
 
 
 def main():
+    validate_fire_args(MeetingSimulator)
     fire.Fire(MeetingSimulator)
 
 

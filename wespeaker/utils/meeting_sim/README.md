@@ -36,7 +36,7 @@ wespeaker-meeting-sim enroll \
     [--device cpu|cuda:0] \
     [--config <config.yaml>] \
     [--similarity_thresh 0.75] \
-    [--max_enrol_utts 20] \
+    [--max_enroll_utts 20] \
     [--precompute_vad] \
     [--n_workers 8] \
     [--seed 42]
@@ -44,14 +44,14 @@ wespeaker-meeting-sim enroll \
 
 Reads Kaldi-style `wav.scp` and `utt2spk` files.
 Provide `--embedding_scp` to load pre-extracted embeddings from ark/scp format, or `--model_dir` to extract them on the fly with a wespeaker model.
-Only embeddings needed for enrolment are loaded (random-access from the ark file based on `max_enrol_utts` subsampling), so this is fast even with large embedding archives.
+Only embeddings needed for enrolment are loaded (random-access from the ark file based on `max_enroll_utts` subsampling), so this is fast even with large embedding archives.
 
 Computes pairwise cosine similarities and clusters speakers with agglomerative clustering at `similarity_thresh`.
 
-Parameters default to values from the config file (`speakers.similarity_thresh`, `speakers.max_enrol_utts`, `batch.seed`, `batch.n_workers`).
+Parameters default to values from the config file (`speakers.similarity_thresh`, `speakers.max_enroll_utts`, `batch.seed`, `batch.n_workers`).
 CLI flags override config values.
 
-Use `--max_enrol_utts` to cap the number of utterances used per speaker when computing the mean embedding.
+Use `--max_enroll_utts` to cap the number of utterances used per speaker when computing the mean embedding.
 If omitted, all available utterances are used.
 
 Pass `--precompute_vad` to run Silero VAD on all utterances and cache the speech boundaries in the pool.
@@ -135,7 +135,7 @@ Key sections:
 | Key                    | Default                  | Description                                          |
 |------------------------|--------------------------|------------------------------------------------------|
 | `n_speakers`           | 3                        | Number of participants per meeting                   |
-| `max_enrol_utts`       | 3                        | Max utterances per speaker for mean embedding (null = all) |
+| `max_enroll_utts`       | 3                        | Max utterances per speaker for mean embedding (null = all) |
 | `similarity_mode`      | similar-close-subgroup   | Speaker selection strategy (see below)               |
 | `similar_subgroup_size`| 2                        | Size of the similar subgroup (subgroup modes)        |
 | `fallback_strategy`    | dissimilar               | How to fill remaining slots: `random` or `dissimilar`|
@@ -334,10 +334,10 @@ from wespeaker.utils.meeting_sim.speakers import (
   - `clusters` -- dict of cluster_id -> list of speaker_ids
   - `speaker_to_cluster` -- dict of speaker_id -> cluster_id
 
-**`build_speaker_pool(wav_scp, utt2spk, embedding_scp=None, model_dir=None, device='cpu', max_enrol_utts=None, seed=42)`**
+**`build_speaker_pool(wav_scp, utt2spk, embedding_scp=None, model_dir=None, device='cpu', max_enroll_utts=None, seed=42)`**
   Construct pool from Kaldi-format files.
   Returns `SpeakerPool` with similarity matrix computed.
-  `max_enrol_utts` caps utterances per speaker for mean embedding (None = use all).
+  `max_enroll_utts` caps utterances per speaker for mean embedding (None = use all).
   When `embedding_scp` is provided, only the needed utterances are loaded via random access.
 
 **`cluster_speakers(pool, similarity_thresh=0.75)`**
