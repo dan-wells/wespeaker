@@ -17,10 +17,15 @@
 
 . ./path.sh || exit 1
 
+set -euo pipefail
+
 stage=-1
 stop_stage=-1
 sad_type="oracle"       # oracle/system
+assign_type="cluster"   # cluster/identify/beamform
 cluster_type="spectral" # spectral/umap
+beamform_mode="supervised"  # supervised/unsupervised
+beamform_n_workers=4
 
 emb_window=1.5
 emb_stride=0.75
@@ -28,6 +33,7 @@ subseg_cmn=true  # do cmn on the sub-segment (causal) or on the vad segment (non
 get_each_file_res=1
 
 pretrained_model=pretrained_models/voxceleb_resnet34_LM.onnx
+enrol_scp=""
 data_dir=""
 exp_label=""
 
@@ -39,9 +45,22 @@ if [ -z "$data_dir" ]; then
 fi
 
 exp="exp"
-if [ -n "$exp_label" ]; then
-    exp="${exp}/${exp_label}"
+
+# Build exp_label from parameters if not provided
+if [ -z "$exp_label" ]; then
+    if [ "$assign_type" == "cluster" ]; then
+        assign_tag="${cluster_type}_cluster"
+    elif [ "$assign_type" == "identify" ]; then
+        assign_tag="identify"
+    elif [ "$assign_type" == "beamform" ]; then
+        assign_tag="beamform_${beamform_mode}"
+    else
+        echo "Error: unknown assign_type '${assign_type}'"
+        exit 1
+    fi
+    exp_label="${assign_tag}_win_${emb_window}_stride_${emb_stride}_${sad_type}_sad"
 fi
+exp="${exp}/${exp_label}"
 
 mkdir -p ${data_dir}/${exp}
 
@@ -64,6 +83,12 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
         utt=$(basename $(dirname ${path}))
         echo "${utt} ${path}"
     done > ${data_dir}/wav.scp
+
+    # Prepare multichannel wav.scp (for beamform mode)
+    find ${data_dir}/ -name "multichannel.wav" | sort -u | while read -r path; do
+        utt=$(basename $(dirname ${path}))
+        echo "${utt} ${path}"
+    done > ${data_dir}/wav_multichannel.scp
 
     # Prepare RTTM for oracle SAD and scoring
     mkdir -p ${data_dir}/${exp}/ref_rttm
@@ -95,14 +120,14 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
 fi
 
 
-# Extract fbank features
-if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
+# Extract fbank features (skip for beamform mode)
+if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && [ "$assign_type" != "beamform" ]; then
 
     [ -d "${data_dir}/${exp}/${sad_type}_sad_fbank" ] && rm -r ${data_dir}/${exp}/${sad_type}_sad_fbank
 
-    echo "================================"
+    echo "================================================================================"
     echo "Make Fbank features and store it under ${data_dir}/${exp}/${sad_type}_sad_fbank"
-    echo "================================"
+    echo "================================================================================"
     mkdir -p ${data_dir}/${exp}/${sad_type}_sad_fbank
     python3 wespeaker/diar/make_fbank.py \
         --scp ${data_dir}/wav.scp \
@@ -111,14 +136,14 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
         --subseg-cmn ${subseg_cmn}
 fi
 
-# Extract embeddings
-if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
+# Extract embeddings (skip for beamform mode)
+if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && [ "$assign_type" != "beamform" ]; then
 
     [ -d "${data_dir}/${exp}/${sad_type}_sad_embedding" ] && rm -r ${data_dir}/${exp}/${sad_type}_sad_embedding
 
-    echo "================================"
+    echo "================================================================================"
     echo "Extract embeddings and store it under ${exp}/${sad_type}_sad_embedding"
-    echo "================================"
+    echo "================================================================================"
     mkdir -p ${data_dir}/${exp}/${sad_type}_sad_embedding
     python3 wespeaker/diar/extract_emb.py \
         --scp ${data_dir}/${exp}/${sad_type}_sad_fbank/fbank.scp \
@@ -133,50 +158,95 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
 fi
 
 
-# Applying spectral or ump+hdbscan clustering algorithm
+# Speaker assignment (cluster / identify / beamform)
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
 
-    [ -f "${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_labels" ] && rm ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_labels
+    labels_file="${data_dir}/${exp}/${sad_type}_sad_labels"
+    [ -f "${labels_file}" ] && rm "${labels_file}"
 
-    echo "================================"
-    echo "Doing ${cluster_type} clustering and store the result in ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_labels"
-    echo "================================"
-    mkdir -p ${data_dir}/${exp}/${cluster_type}_cluster
-    python3 wespeaker/diar/${cluster_type}_clusterer.py \
-            --scp ${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp \
-            --output ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_labels
+    echo "================================================================================"
+    echo "Assigning speakers (${assign_type}) -> ${labels_file}"
+    echo "================================================================================"
+
+    if [ "$assign_type" == "cluster" ]; then
+        python3 wespeaker/diar/${cluster_type}_clusterer.py \
+                --scp ${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp \
+                --output ${labels_file} \
+                ${utt2num_spks:+--utt2num_spks ${utt2num_spks}}
+
+    elif [ "$assign_type" == "identify" ]; then
+        if [ -z "$enrol_scp" ]; then
+            echo "Error: --enrol_scp is required for assign_type=identify"
+            exit 1
+        fi
+        python3 wespeaker/diar/identify.py \
+                --scp ${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp \
+                --enrol-scp ${enrol_scp} \
+                --metadata-dir ${data_dir}/meetings \
+                --output ${labels_file}
+
+    elif [ "$assign_type" == "beamform" ]; then
+        beamform_args="--wav-scp ${data_dir}/wav_multichannel.scp \
+                --segments ${data_dir}/${exp}/${sad_type}_sad \
+                --output ${labels_file} \
+                --mode ${beamform_mode} \
+                --window-secs ${emb_window} \
+                --period-secs ${emb_stride} \
+                --n-workers ${beamform_n_workers}"
+        if [ "$beamform_mode" == "supervised" ]; then
+            beamform_args="${beamform_args} --metadata-dir ${data_dir}/meetings"
+        fi
+        python3 wespeaker/diar/beamform_diar.py ${beamform_args}
+    fi
 fi
 
 
 # Convert labels to RTTMs
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     python3 wespeaker/diar/make_rttm.py \
-            --labels ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_labels \
-            --channel 1 > ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_rttm
+            --labels ${data_dir}/${exp}/${sad_type}_sad_labels \
+            --channel 1 > ${data_dir}/${exp}/${sad_type}_sad_rttm
+
+    if [ "${map_spk_ids}" == "true" ]; then
+        hyp_rttm="${data_dir}/${exp}/${sad_type}_sad_rttm"
+        mapped_rttm="${data_dir}/${exp}/${sad_type}_sad_rttm_mapped"
+        if [ -n "${enrol_scp}" ]; then
+            python3 wespeaker/diar/map_speakers.py \
+                --hyp-rttm "${hyp_rttm}" \
+                --output "${mapped_rttm}" \
+                --enrol-scp "${enrol_scp}" \
+                --emb-scp "${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp"
+        else
+            python3 wespeaker/diar/map_speakers.py \
+                --hyp-rttm "${hyp_rttm}" \
+                --output "${mapped_rttm}" \
+                --ref-rttm <(cat "${data_dir}/${exp}/ref_rttm/"*.rttm)
+        fi
+    fi
 fi
 
 
 # Evaluate the result
 if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
     ref_dir=${data_dir}/${exp}/ref_rttm
-    echo "================================"
+    echo "================================================================================"
     echo "Compute DER results"
-    echo "================================"
+    echo "================================================================================"
     perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
          -c 0.25 \
          -r <(cat ${ref_dir}/*.rttm) \
-         -s ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_rttm 2>&1 | tee ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_res
+         -s ${data_dir}/${exp}/${sad_type}_sad_rttm 2>&1 | tee ${data_dir}/${exp}/${sad_type}_sad_res
 
     if [ ${get_each_file_res} -eq 1 ];then
-        single_file_res_dir=${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_single_file_res
+        single_file_res_dir=${data_dir}/${exp}/${sad_type}_single_file_res
         mkdir -p $single_file_res_dir
         echo "Compute per-file DER results, stored under ${single_file_res_dir}"
 
-        awk '{print $2}' ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_rttm | sort -u  | while read file_name; do
+        awk '{print $2}' ${data_dir}/${exp}/${sad_type}_sad_rttm | sort -u  | while read file_name; do
             perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
                  -c 0.25 \
                  -r <(cat ${ref_dir}/${file_name}.rttm) \
-                 -s <(grep "${file_name}" ${data_dir}/${exp}/${cluster_type}_cluster/${sad_type}_sad_rttm) > ${single_file_res_dir}/${file_name}_res
+                 -s <(grep "${file_name}" ${data_dir}/${exp}/${sad_type}_sad_rttm) > ${single_file_res_dir}/${file_name}_res
         done
         echo "Done!"
     fi
