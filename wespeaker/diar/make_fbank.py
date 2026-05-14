@@ -56,6 +56,9 @@ def get_speech_segments(utt_to_wav, utt_to_segments):
     for utt, wav_path in utt_to_wav.items():
         segments = utt_to_segments[utt]
         signal, sr = torchaudio.load(wav_path)
+        if sr != 16000:
+            signal = torchaudio.functional.resample(signal, sr, 16000)
+            sr = 16000
         signal = signal.squeeze()
 
         for seg, begin, end in segments:
