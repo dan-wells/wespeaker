@@ -204,6 +204,13 @@ def _generate_single_meeting(meeting_idx, pool, cfg, base_seed,
     speaker_index_map = {
         spk.speaker_id: i for i, spk in enumerate(speakers)}
 
+    # Per-speaker RMS normalization
+    speaker_rms = None
+    target_rms = None
+    if all(getattr(spk, 'rms', None) is not None for spk in speakers):
+        speaker_rms = {spk.speaker_id: spk.rms for spk in speakers}
+        target_rms = float(np.mean(list(speaker_rms.values())))
+
     # Compute subgroup indices for exchange bursts
     subgroup_size = speakers_cfg.get('similar_subgroup_size', 2)
     use_distant = (similarity_mode == 'similar-distant-subgroup')
@@ -419,10 +426,14 @@ class MeetingSimulator:
                     similarity_thresh)
         pool = cluster_speakers(pool, similarity_thresh)
 
+        sample_rate = cfg.get('resample_rate', 16000)
+
         if precompute_vad:
-            sample_rate = cfg.get('resample_rate', 16000)
             pool = compute_vad_segments(
                 pool, sample_rate=sample_rate, n_workers=n_workers)
+
+        pool = compute_speaker_rms(
+            pool, sample_rate=sample_rate, n_workers=n_workers)
 
         save_pool(pool, output_dir)
         logger.info("Done. Pool saved to %s", output_dir)

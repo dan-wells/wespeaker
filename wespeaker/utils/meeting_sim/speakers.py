@@ -14,6 +14,7 @@ from itertools import combinations
 
 import kaldiio
 import numpy as np
+import torchaudio
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 from tqdm import tqdm
@@ -35,14 +36,17 @@ class SpeakerInfo:
         computed.
       vad_segments: Dict mapping wav_path -> list of (start_sample,
         end_sample) tuples from VAD. None if not yet computed.
+      rms: Mean RMS energy of the speaker's utterances (float), or
+        None if not yet computed.
     """
 
     def __init__(self, speaker_id, wav_paths, embedding=None,
-                 vad_segments=None):
+                 vad_segments=None, rms=None):
         self.speaker_id = speaker_id
         self.wav_paths = wav_paths
         self.embedding = embedding
         self.vad_segments = vad_segments if vad_segments is not None else {}
+        self.rms = rms
 
 
 class SpeakerPool:
@@ -421,6 +425,110 @@ def _vad_worker(wav_path, sample_rate, min_dur):
     # initialisation inside get_speech_segments.
     from wespeaker.utils.meeting_sim.turns import get_speech_segments
     return get_speech_segments(wav_path, sample_rate, min_dur)
+
+
+def compute_speaker_rms(pool, sample_rate=16000, n_workers=1):
+    """Compute mean RMS energy per speaker across all utterances.
+
+    For each utterance, RMS is computed over speech-active regions if
+    VAD segments are available in the pool, otherwise over the whole
+    file. The per-speaker mean RMS is stored in SpeakerInfo.rms.
+
+    Args:
+      pool: SpeakerPool with speakers populated. If vad_segments are
+        available, they are used to restrict RMS to speech regions.
+      sample_rate: Target sample rate for audio loading.
+      n_workers: Number of parallel workers.
+
+    Returns:
+      The same SpeakerPool with rms values populated.
+    """
+    all_paths = []
+    for spk_id in pool.speaker_ids:
+        spk = pool.speakers[spk_id]
+        for wav_path in spk.wav_paths:
+            vad_segs = spk.vad_segments.get(wav_path)
+            all_paths.append((spk_id, wav_path, vad_segs))
+
+    logger.info("Computing speaker RMS for %d utterances (workers=%d)",
+                len(all_paths), n_workers)
+
+    # Collect per-utterance RMS values keyed by speaker
+    spk_rms_values = {spk_id: [] for spk_id in pool.speaker_ids}
+
+    if n_workers <= 1:
+        for spk_id, wav_path, vad_segs in tqdm(all_paths,
+                                                desc="Computing RMS"):
+            rms = _rms_worker(wav_path, sample_rate, vad_segs)
+            if rms is not None:
+                spk_rms_values[spk_id].append(rms)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(
+                    _rms_worker, wav_path, sample_rate, vad_segs
+                ): spk_id
+                for spk_id, wav_path, vad_segs in all_paths
+            }
+            for future in tqdm(as_completed(futures),
+                               total=len(futures),
+                               desc="Computing RMS"):
+                spk_id = futures[future]
+                rms = future.result()
+                if rms is not None:
+                    spk_rms_values[spk_id].append(rms)
+
+    for spk_id in pool.speaker_ids:
+        values = spk_rms_values[spk_id]
+        if values:
+            pool.speakers[spk_id].rms = float(np.mean(values))
+        else:
+            logger.warning("Speaker %s: no valid RMS values.", spk_id)
+
+    return pool
+
+
+def _rms_worker(wav_path, sample_rate, vad_segments=None):
+    """Compute RMS energy for a single utterance.
+
+    Args:
+      wav_path: Path to audio file.
+      sample_rate: Target sample rate in Hz.
+      vad_segments: Optional list of (start_sample, end_sample) tuples.
+        If provided, RMS is computed only over these regions.
+
+    Returns:
+      Float RMS value, or None if the file cannot be loaded or has
+        no audio samples.
+    """
+    try:
+        waveform, sr = torchaudio.load(wav_path)
+    except Exception as exc:
+        logger.warning("Failed to load %s: %s", wav_path, exc)
+        return None
+
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != sample_rate:
+        resampler = torchaudio.transforms.Resample(sr, sample_rate)
+        waveform = resampler(waveform)
+
+    audio = waveform.squeeze(0).numpy().astype(np.float64)
+
+    if vad_segments:
+        parts = []
+        for start, end in vad_segments:
+            end = min(end, len(audio))
+            if start < end:
+                parts.append(audio[start:end])
+        if parts:
+            audio = np.concatenate(parts)
+        # else fall through to use whole file
+
+    if len(audio) == 0:
+        return None
+
+    return float(np.sqrt(np.mean(audio ** 2)))
 
 
 def select_speakers(pool, n_speakers=3, similarity_mode='random',

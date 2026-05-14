@@ -59,6 +59,10 @@ This makes subsequent batch generation significantly faster (no per-turn VAD inf
 Use `--n_workers` to parallelise VAD computation across processes.
 Without `--precompute_vad`, VAD runs on the fly during generation.
 
+Per-speaker RMS energy is always computed during enrolment and cached in the pool.
+If VAD segments are available (from `--precompute_vad`), RMS is measured over speech-active regions only; otherwise it is measured over the full utterance.
+During generation, speaker levels are normalized to a common target RMS before RIR convolution, compensating for recording-level differences across speakers (see [Per-speaker level normalization](#per-speaker-level-normalization)).
+
 Outputs `pool.pkl` and `similarity_matrix.npy` in `output_dir`.
 
 ### `generate` -- Batch-Generate Meetings
@@ -135,7 +139,7 @@ Key sections:
 | Key                    | Default                  | Description                                          |
 |------------------------|--------------------------|------------------------------------------------------|
 | `n_speakers`           | 3                        | Number of participants per meeting                   |
-| `max_enroll_utts`       | 3                        | Max utterances per speaker for mean embedding (null = all) |
+| `max_enroll_utts`       | null                     | Max utterances per speaker for mean embedding (null = all) |
 | `similarity_mode`      | similar-close-subgroup   | Speaker selection strategy (see below)               |
 | `similar_subgroup_size`| 2                        | Size of the similar subgroup (subgroup modes)        |
 | `fallback_strategy`    | dissimilar               | How to fill remaining slots: `random` or `dissimilar`|
@@ -335,12 +339,13 @@ from wespeaker.utils.meeting_sim.room import (
 from wespeaker.utils.meeting_sim.speakers import (
     SpeakerInfo, SpeakerPool,
     build_speaker_pool, cluster_speakers, compute_vad_segments,
-    select_speakers, find_subgroup_positions, save_pool, load_pool,
+    compute_speaker_rms, select_speakers, find_subgroup_positions,
+    save_pool, load_pool,
 )
 ```
 
-**`SpeakerInfo(speaker_id, wav_paths, embedding=None, vad_segments=None)`**
-  Single speaker: ID, list of audio paths, mean embedding vector, and optional cached VAD segments (dict of wav_path -> list of (start_sample, end_sample) tuples).
+**`SpeakerInfo(speaker_id, wav_paths, embedding=None, vad_segments=None, rms=None)`**
+  Single speaker: ID, list of audio paths, mean embedding vector, optional cached VAD segments (dict of wav_path -> list of (start_sample, end_sample) tuples), and optional mean RMS energy (float).
 
 **`SpeakerPool`**
   Attributes:
@@ -362,6 +367,11 @@ from wespeaker.utils.meeting_sim.speakers import (
 
 **`compute_vad_segments(pool, sample_rate=16000, min_dur=0.1, n_workers=1)`**
   Run Silero VAD on all utterances and cache segments in each `SpeakerInfo.vad_segments`.
+  Parallelisable via `n_workers`.
+
+**`compute_speaker_rms(pool, sample_rate=16000, n_workers=1)`**
+  Compute mean RMS energy per speaker across all utterances, stored in `SpeakerInfo.rms`.
+  Uses VAD segments when available (restricts RMS to speech-active regions).
   Parallelisable via `n_workers`.
 
 **`select_speakers(pool, n_speakers, similarity_mode, ...)`**
@@ -416,9 +426,11 @@ from wespeaker.utils.meeting_sim.mixer import (
   Controls mixing behaviour and which outputs to produce.
   `output_channels` is a list of `'mono'`, `'stereo'`, and/or `'multichannel'`; a bare string is also accepted. Defaults to `['mono']`.
 
-**`mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map, rng)`**
+**`mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map, noise_multichannel=None, noise_snr_db=None, rng=None, speaker_rms=None, target_rms=None)`**
   Core mixing function.
   Convolves each turn with its speaker's RIR and sums into multichannel buffers.
+  If `speaker_rms` and `target_rms` are provided, each turn's audio is scaled by `target_rms / speaker_rms[speaker_id]` before RIR convolution.
+  If `noise_multichannel` is provided, scales it to `noise_snr_db` and adds to the multichannel buffer before deriving outputs.
   Returns a dict with keys `'mono'`, `'multichannel'` (optional), `'reverberant'` (optional), `'dry'` (optional), `'rttm'`.
 
 **`write_meeting_outputs(result, output_dir, meeting_id, mix_cfg)`**
@@ -536,6 +548,18 @@ Different overlap types model distinct conversational phenomena:
 - **Simultaneous** (full energy, long) -- extended parallel speech from an independent speaker.
 
 Fade-in envelopes (10 ms) prevent clicks at overlap onsets.
+
+### Per-speaker level normalization
+
+Source recordings can have large level differences across speakers (e.g. 16 dB spread in VCTK) due to varying microphone placement, gain settings, or speaker volume.
+There is no energy normalization elsewhere in the mixing pipeline -- source audio passes straight through RIR convolution and summation -- so without correction, a quietly-recorded speaker ends up unrealistically quiet in the final mix.
+
+During enrolment, `compute_speaker_rms` measures each speaker's mean RMS energy across their utterances.
+If VAD segments are available, RMS is restricted to speech-active regions to avoid dilution by silence.
+At mix time, each turn's audio is scaled by `target_rms / speaker_rms` before RIR convolution and overlap energy scaling.
+The target RMS is the mean of the selected speakers' RMS values, so normalization closes the gap between speakers without shifting the overall output level far from the source recordings.
+
+Pools without pre-computed RMS (e.g. from older enrolment runs) skip normalization silently -- the pool just needs to be re-enrolled to enable it.
 
 ### Per-meeting parameter jitter
 

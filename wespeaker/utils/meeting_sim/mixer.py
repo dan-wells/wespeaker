@@ -67,6 +67,11 @@ def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
       noise_snr_db: Target SNR in dB for noise mixing. Required if
         noise_multichannel is provided.
       rng: numpy random Generator.
+      speaker_rms: Optional dict mapping speaker_id -> float RMS.
+        When provided along with target_rms, each turn's audio is
+        scaled to normalize speaker levels before RIR convolution.
+      target_rms: Target RMS level for normalization. Required if
+        speaker_rms is provided.
 
     Returns:
       Dict with keys:
@@ -114,6 +119,12 @@ def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
         audio = _load_turn_audio(turn, sample_rate)
         if audio is None:
             continue
+
+        # Normalize speaker level
+        if speaker_rms is not None and target_rms is not None:
+            spk_rms = speaker_rms.get(turn.segment.speaker_id)
+            if spk_rms and spk_rms > 0:
+                audio = audio * (target_rms / spk_rms)
 
         # Apply overlap energy scaling
         if turn.overlap is not None:
