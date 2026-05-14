@@ -9,8 +9,10 @@ import logging
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.patches import Wedge
 import numpy as np
 import pyroomacoustics as pra
+import scipy.optimize
 
 
 logger = logging.getLogger('meeting_sim.room')
@@ -317,6 +319,135 @@ def plot_room_topdown(meeting_room):
     ax.set_xlabel('length (m)')
     ax.set_ylabel('width (m)')
     ax.set_title('Room layout (top-down)')
+    return fig
+
+
+def array_angular_resolution(n_mics, spacing, freq=4000.0, c=343.0):
+    """Compute the -3 dB beamwidth of a linear array at a given frequency.
+
+    The half-power points of a uniformly-weighted linear array occur where
+    sinc(x) = 1/sqrt(2). We solve this numerically to get the exact
+    half-power point, then convert to an angular width using the array
+    aperture and wavelength.
+
+    Args:
+      n_mics: Number of microphone elements.
+      spacing: Distance between adjacent elements in meters.
+      freq: Frequency in Hz at which to evaluate resolution.
+      c: Speed of sound in m/s.
+
+    Returns:
+      Beamwidth in degrees (full width between -3 dB points).
+    """
+    # Solve sinc(x) = 1/sqrt(2) for the first positive root
+    # numpy sinc is defined as sin(pi*x)/(pi*x), so we solve that form
+    sinc_half_power = scipy.optimize.brentq(
+        lambda x: np.sinc(x) - 1.0 / np.sqrt(2), 0.1, 1.0)
+
+    wavelength = c / freq
+    aperture = (n_mics - 1) * spacing
+    theta_3dB = np.degrees(2 * sinc_half_power * wavelength / aperture)
+    return theta_3dB
+
+
+def plot_room_doa(meeting_room=None, metadata_path=None, freq=4000.0,
+                  n_mics=8, spacing=0.04, ax=None):
+    """Plot DOA angles and beamwidth wedges on a top-down room layout.
+
+    Draws a direction line from the mic array center to each speaker,
+    annotated with the azimuth angle, plus a shaded wedge showing the
+    array's angular resolution at the given frequency. Lines and wedges
+    extend to the speaker's distance from the array center.
+
+    Accepts either a MeetingRoom instance or a path to a metadata.json
+    file (as written by the meeting simulation pipeline). If both are
+    provided, metadata_path takes precedence.
+
+    Args:
+      meeting_room: MeetingRoom instance (used if metadata_path is None).
+      metadata_path: Path to a meeting metadata.json file.
+      freq: Frequency in Hz for beamwidth calculation.
+      n_mics: Number of microphone elements (used with metadata_path).
+      spacing: Mic element spacing in meters (used with metadata_path).
+      ax: Optional matplotlib Axes to draw on. If None, creates a new
+        figure with room layout.
+
+    Returns:
+      matplotlib.figure.Figure.
+    """
+    import json as _json
+
+    if metadata_path is not None:
+        with open(metadata_path) as mf:
+            metadata = _json.load(mf)
+        mic_center = np.array(metadata['mic_center'])
+        speaker_positions = [
+            np.array(spk['position']) for spk in metadata['speakers']]
+        speaker_ids = [spk['id'] for spk in metadata['speakers']]
+        room_length = metadata['room']['length']
+        room_width = metadata['room']['width']
+    elif meeting_room is not None:
+        mic_center = meeting_room.mic_center
+        speaker_positions = meeting_room.speaker_positions
+        speaker_ids = [f'Spk {i}' for i in range(len(speaker_positions))]
+        room_length = meeting_room.room_config.length
+        room_width = meeting_room.room_config.width
+        n_mics = meeting_room.array_config.n_mics
+        spacing = meeting_room.array_config.spacing
+    else:
+        raise ValueError(
+            "Either meeting_room or metadata_path must be provided")
+
+    mc = mic_center[:2]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        # Room boundary
+        ax.add_patch(patches.Rectangle(
+            (0, 0), room_length, room_width,
+            linewidth=2, edgecolor='black', facecolor='none'))
+        # Mic array center
+        ax.scatter(mc[0], mc[1], marker='s', c='blue', s=40, zorder=3)
+        ax.annotate('Mic array', (mc[0], mc[1]),
+                    textcoords='offset points', xytext=(5, -10))
+        ax.set_xlim(-0.3, room_length + 0.3)
+        ax.set_ylim(-0.3, room_width + 0.3)
+        ax.set_aspect('equal')
+        ax.set_xlabel('length (m)')
+        ax.set_ylabel('width (m)')
+    else:
+        fig = ax.figure
+
+    # Compute reference azimuths and distances (degrees, 0 = +x axis)
+    azimuths = []
+    distances = []
+    for pos in speaker_positions:
+        dx = pos[0] - mic_center[0]
+        dy = pos[1] - mic_center[1]
+        azimuths.append(np.degrees(np.arctan2(dy, dx)) % 360)
+        distances.append(np.sqrt(dx**2 + dy**2))
+
+    # Compute beamwidth
+    theta_3dB = array_angular_resolution(n_mics, spacing, freq)
+
+    for i, (az_deg, dist) in enumerate(zip(azimuths, distances)):
+        spk_xy = speaker_positions[i][:2]
+        ax.plot([mc[0], spk_xy[0]], [mc[1], spk_xy[1]],
+                'r-', lw=1.5, zorder=2)
+        ax.scatter(spk_xy[0], spk_xy[1], marker='o', c='red', s=80, zorder=3)
+        wrapped = ((az_deg + 180) % 360) - 180
+        ax.annotate(f'{speaker_ids[i]} ({wrapped:.1f}\u00b0)',
+                    (spk_xy[0], spk_xy[1]),
+                    textcoords='offset points', xytext=(5, 5),
+                    fontsize=8)
+
+        # Beamwidth wedge extending to speaker distance
+        wedge = Wedge(mc, dist,
+                      az_deg - theta_3dB / 2, az_deg + theta_3dB / 2,
+                      alpha=0.12, color='red', zorder=1)
+        ax.add_patch(wedge)
+
+    ax.set_title(f'DOA angles (beamwidth = {theta_3dB:.1f}\u00b0 at {freq:.0f} Hz)')
     return fig
 
 
