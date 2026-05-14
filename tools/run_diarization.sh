@@ -30,6 +30,7 @@ beamform_n_workers=4
 emb_window=1.5
 emb_stride=0.75
 subseg_cmn=true  # do cmn on the sub-segment (causal) or on the vad segment (non-causal)
+utt2num_spks=""  # oracle number of speakers per file for spectral clustering
 get_each_file_res=1
 
 pretrained_model=pretrained_models/voxceleb_resnet34_LM.onnx

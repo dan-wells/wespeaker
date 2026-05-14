@@ -20,17 +20,17 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import argparse
-from collections import OrderedDict
 import concurrent.futures as cf
-import kaldiio
+from collections import OrderedDict
 
+import kaldiio
 import numpy as np
 import scipy.linalg
 from sklearn.cluster._kmeans import k_means
 from wespeaker.utils.utils import validate_path
 
 
-def cluster(embeddings, p=.01, num_spks=None, min_num_spks=1, max_num_spks=20):
+def cluster(embeddings, num_spks=None, min_num_spks=1, max_num_spks=20, p=.01):
     # Define utility functions
     def cosine_similarity(M):
         M = M / np.linalg.norm(M, axis=1, keepdims=True)
@@ -79,8 +79,7 @@ def cluster(embeddings, p=.01, num_spks=None, min_num_spks=1, max_num_spks=20):
     # Compute Laplacian
     laplacian_matrix = laplacian(pruned_similarity_matrix)
     # Compute spectral embeddings
-    spectral_embeddings = spectral(laplacian_matrix, num_spks, min_num_spks,
-                                   max_num_spks)
+    spectral_embeddings = spectral(laplacian_matrix, num_spks, min_num_spks, max_num_spks)
     # Assign class labels
     labels = kmeans(spectral_embeddings)
 
@@ -105,10 +104,21 @@ def read_emb(scp):
     return subsegs_list, embeddings_list
 
 
+def read_num_spks(scp):
+    utt2num_spks = {}
+    with open(scp) as f:
+        for line in f:
+            utt_id, num_spks = line.strip().split()
+            utt2num_spks[utt_id] = int(num_spks)
+    return utt2num_spks
+
+
 def get_args():
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--scp', required=True, help='embedding scp')
     parser.add_argument('--output', required=True, help='output label file')
+    parser.add_argument('--utt2num_spks', type=str, default=None,
+                        help='file mapping utterance ID to number of speakers (optional)')
     args = parser.parse_args()
     return args
 
@@ -116,10 +126,13 @@ def get_args():
 def main():
     args = get_args()
     subsegs_list, embeddings_list = read_emb(args.scp)
+    utt2num_spks = read_num_spks(args.utt2num_spks) if args.utt2num_spks is not None else {}
+    num_spks_list = [utt2num_spks.get(subseg[0].split('-')[0], None)
+                     for subseg in subsegs_list]
     validate_path(args.output)
     with cf.ProcessPoolExecutor() as executor, open(args.output, 'w') as f:
         for (subsegs, labels) in zip(subsegs_list,
-                                     executor.map(cluster, embeddings_list)):
+                                     executor.map(cluster, embeddings_list, num_spks_list)):
             [
                 print(subseg, label, file=f)
                 for (subseg, label) in zip(subsegs, labels)
