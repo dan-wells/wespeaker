@@ -313,6 +313,7 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
                      utt_id=None,
                      start_time=None, end_time=None,
                      show_overlap=False, ref_style='field',
+                     doa_timeline=None,
                      monochrome=False, figsize=None, ax=None):
     """Plot diarization results with optional reference comparison.
 
@@ -348,10 +349,16 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
           Missed speech is visible as faint bar with no solid overlay.
         - "hollow": Hollow rectangle outline around reference segments.
         - "line": Thin line slightly offset below the hypothesis track.
+      doa_timeline: Optional dict as returned by
+        beamform_diar.compute_doa_timeline(), with keys
+        'doa_by_speaker' and 'ref_azimuths'. If provided, adds a DOA
+        timeline subplot below the diarization tracks. Ignored if ax
+        is provided.
       monochrome: If True, use greyscale colours instead of colour cycle.
       figsize: Optional tuple (width, height) for the figure.
-      ax: Optional matplotlib Axes to plot on. If provided, wav_path is
-        ignored and diarization is drawn on this axes.
+      ax: Optional matplotlib Axes to plot on. If provided, wav_path
+        and doa_timeline are ignored and diarization is drawn on this
+        axes only.
 
     Returns:
       Tuple of (fig, axes) where axes is a single Axes or ndarray of
@@ -407,16 +414,36 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
         axes_out = ax
     else:
         show_rms = wav_path is not None
+        show_doa = doa_timeline is not None
         if figsize is None:
-            height = max(3, n_tracks * 0.6 + (2 if show_rms else 0))
+            height = max(3, n_tracks * 0.6
+                         + (2 if show_rms else 0)
+                         + (2.5 if show_doa else 0))
             figsize = (12, height)
 
+        # Build subplot grid
+        n_subplots = 1 + int(show_rms) + int(show_doa)
+        ratios = []
         if show_rms:
-            fig, (rms_ax, diar_ax) = plt.subplots(
-                2, 1, figsize=figsize, sharex=True,
+            ratios.append(1)
+        ratios.append(3)
+        if show_doa:
+            ratios.append(2)
+
+        if n_subplots > 1:
+            fig, axes_arr = plt.subplots(
+                n_subplots, 1, figsize=figsize, sharex=True,
                 constrained_layout=True,
-                gridspec_kw={'height_ratios': [1, 3], 'hspace': 0.08})
-            axes_out = np.array([rms_ax, diar_ax])
+                gridspec_kw={'height_ratios': ratios, 'hspace': 0.08})
+            idx = 0
+            if show_rms:
+                rms_ax = axes_arr[idx]
+                idx += 1
+            diar_ax = axes_arr[idx]
+            idx += 1
+            if show_doa:
+                doa_ax = axes_arr[idx]
+            axes_out = axes_arr
         else:
             fig, diar_ax = plt.subplots(1, 1, figsize=figsize,
                                         constrained_layout=True)
@@ -500,9 +527,13 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
     # Formatting
     diar_ax.set_yticks([i * _TRACK_SPACING for i in range(n_tracks)])
     diar_ax.set_yticklabels(all_speakers)
-    diar_ax.set_xlabel('Time (s)')
     diar_ax.set_ylim(-0.5, (n_tracks - 1) * _TRACK_SPACING + 0.5)
     diar_ax.invert_yaxis()
+    # Only show x-label on the bottom-most subplot
+    if doa_timeline is not None and ax is None:
+        plt.setp(diar_ax.get_xticklabels(), visible=False)
+    else:
+        diar_ax.set_xlabel('Time (s)')
 
     # Set x-axis limits
     if start_time is not None or end_time is not None:
@@ -534,7 +565,66 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
                 alpha=0.6, solid_capstyle='butt', label='Reference'))
     diar_ax.legend(handles=legend_handles, loc='upper right', fontsize='small')
 
+    # Plot DOA timeline
+    if doa_timeline is not None and ax is None:
+        plot_doa_timeline(
+            doa_timeline['doa_by_speaker'],
+            ref_azimuths=doa_timeline.get('ref_azimuths'),
+            ax=doa_ax)
+
     return fig, axes_out
+
+
+def _wrap_angle(deg):
+    """Wrap angle to [-180, 180) range (0 = broadside / +x axis)."""
+    return ((deg + 180) % 360) - 180
+
+
+def plot_doa_timeline(doa_by_speaker, ref_azimuths=None, ax=None,
+                      figsize=(12, 4)):
+    """Plot DOA estimates over time, coloured by ground-truth speaker.
+
+    The y-axis is wrapped so that 0 degrees (broadside, positive x-axis)
+    is at the centre, with the range [-180, 180]. This maps naturally
+    onto the room layout where the mic array faces into the room.
+
+    Args:
+      doa_by_speaker: Dict mapping speaker_id to list of
+        (midpoint_s, doa_degrees) tuples. Angles in [0, 360).
+      ref_azimuths: Optional dict mapping speaker_id to reference
+        azimuth in degrees. Drawn as horizontal dashed lines.
+      ax: Optional matplotlib Axes. If None, creates a new figure.
+      figsize: Figure size tuple (width, height).
+
+    Returns:
+      Tuple of (fig, ax).
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    else:
+        fig = ax.figure
+
+    colours = _DEFAULT_COLOURS
+    speakers = sorted(doa_by_speaker.keys())
+
+    for i, spk in enumerate(speakers):
+        colour = colours[i % len(colours)]
+        points = doa_by_speaker[spk]
+        times = [p[0] for p in points]
+        doas = [_wrap_angle(p[1]) for p in points]
+        ax.scatter(times, doas, c=colour, s=8, alpha=0.6, label=spk)
+
+        if ref_azimuths is not None and spk in ref_azimuths:
+            ax.axhline(_wrap_angle(ref_azimuths[spk]), color=colour,
+                       ls='--', lw=1.5, alpha=0.7)
+
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('DOA (degrees)')
+    ax.set_ylim(-180, 180)
+    ax.axhline(0, color='#cccccc', lw=0.5, zorder=0)
+    ax.legend(loc='upper right', fontsize='small')
+
+    return fig, ax
 
 
 def _find_overlap_regions(segments):
