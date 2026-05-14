@@ -26,18 +26,18 @@ Designed for notebook use::
 """
 
 import argparse
-from collections import OrderedDict
 
-import kaldiio
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import linear_sum_assignment
-from sklearn.metrics.pairwise import cosine_similarity
 import torchaudio
 
 from wespeaker.diar.make_oracle_sad import read_rttm
+from wespeaker.diar.map_speakers import (
+    map_speakers_by_overlap,
+    map_speakers_by_embeddings,
+)
 
 # Default colour palette (tab10, colourblind-friendly)
 _DEFAULT_COLOURS = [
@@ -58,204 +58,6 @@ _REF_BG_LINEWIDTH = 12
 _REF_BG_ALPHA = 0.2
 _REF_HOLLOW_LINEWIDTH = 1.5
 _REF_LINE_LINEWIDTH = 1.5
-
-
-def map_speakers_by_overlap(ref_segments, hyp_segments):
-    """Map hypothesis speaker labels to reference labels by temporal overlap.
-
-    Builds an overlap matrix between all (ref_speaker, hyp_speaker) pairs
-    and solves the optimal one-to-one assignment using the Hungarian
-    algorithm.
-
-    Args:
-      ref_segments: List of (start, end, speaker_label) tuples from
-        reference RTTM.
-      hyp_segments: List of (start, end, speaker_label) tuples from
-        hypothesis RTTM.
-
-    Returns:
-      Dict mapping hyp_speaker_label -> ref_speaker_label. Hypothesis
-      speakers without a match (when n_hyp > n_ref) retain their
-      original labels.
-    """
-    ref_speakers = sorted(set(seg[2] for seg in ref_segments))
-    hyp_speakers = sorted(set(seg[2] for seg in hyp_segments))
-
-    # Group segments by speaker
-    ref_by_spk = {spk: [(s, e) for s, e, sp in ref_segments if sp == spk]
-                  for spk in ref_speakers}
-    hyp_by_spk = {spk: [(s, e) for s, e, sp in hyp_segments if sp == spk]
-                  for spk in hyp_speakers}
-
-    # Build overlap matrix
-    overlap = np.zeros((len(ref_speakers), len(hyp_speakers)))
-    for i, rspk in enumerate(ref_speakers):
-        for j, hspk in enumerate(hyp_speakers):
-            overlap[i, j] = _compute_overlap(ref_by_spk[rspk],
-                                             hyp_by_spk[hspk])
-
-    # Hungarian assignment (maximise overlap -> minimise negative)
-    row_ind, col_ind = linear_sum_assignment(-overlap)
-
-    mapping = {}
-    for r, c in zip(row_ind, col_ind):
-        if overlap[r, c] > 0:
-            mapping[hyp_speakers[c]] = ref_speakers[r]
-
-    # Unmapped hyp speakers keep their original label
-    for hspk in hyp_speakers:
-        if hspk not in mapping:
-            mapping[hspk] = hspk
-
-    return mapping
-
-
-def _compute_overlap(segs_a, segs_b):
-    """Compute total temporal overlap between two sorted segment lists.
-
-    Args:
-      segs_a: Sorted list of (start, end) tuples.
-      segs_b: Sorted list of (start, end) tuples.
-
-    Returns:
-      Total overlap duration in seconds.
-    """
-    total = 0.0
-    i, j = 0, 0
-    while i < len(segs_a) and j < len(segs_b):
-        start_a, end_a = segs_a[i]
-        start_b, end_b = segs_b[j]
-        overlap = max(0.0, min(end_a, end_b) - max(start_a, start_b))
-        total += overlap
-        if end_a <= end_b:
-            i += 1
-        else:
-            j += 1
-    return total
-
-
-def map_speakers_by_embeddings(emb_scp, hyp_segments, enrol_scp):
-    """Map hypothesis speaker labels to enrolled speakers via embeddings.
-
-    Loads sub-segment embeddings from the diarization pipeline, computes
-    a centroid for each hypothesis cluster, then scores centroids against
-    enrolled speaker embeddings using cosine similarity.
-
-    Args:
-      emb_scp: Path to the emb.scp file from the diarization pipeline
-        (sub-segment embeddings).
-      hyp_segments: List of (start, end, speaker_label) tuples from
-        hypothesis RTTM.
-      enrol_scp: Path to enrolment embedding .scp file, keyed by
-        speaker ID (one embedding per speaker). Produced by the
-        meeting-sim enroll step or any speaker embedding extraction
-        pipeline.
-
-    Returns:
-      Dict mapping hyp_speaker_label -> enrolled_speaker_id (best match).
-    """
-    # Load enrolment embeddings
-    enrol_ids = []
-    enrol_embs = []
-    for spk_id, emb in kaldiio.load_scp_sequential(enrol_scp):
-        enrol_ids.append(spk_id)
-        enrol_embs.append(emb.astype(np.float32))
-    enrol_embs = np.stack(enrol_embs)
-
-    # Load diarization sub-segment embeddings
-    emb_dict = OrderedDict()
-    for subseg_id, emb in kaldiio.load_scp_sequential(emb_scp):
-        emb_dict[subseg_id] = emb.astype(np.float32)
-
-    # Parse sub-segment IDs to get time midpoints and assign to hyp speakers
-    hyp_speakers = sorted(set(seg[2] for seg in hyp_segments))
-    cluster_embs = {spk: [] for spk in hyp_speakers}
-
-    for subseg_id, emb in emb_dict.items():
-        midpoint = _subseg_midpoint(subseg_id)
-        if midpoint is None:
-            continue
-        # Find which hyp segment contains this midpoint
-        spk = _find_speaker_at_time(hyp_segments, midpoint)
-        if spk is not None:
-            cluster_embs[spk].append(emb)
-
-    # Compute L2-normalised centroids
-    centroids = {}
-    for spk, embs in cluster_embs.items():
-        if len(embs) == 0:
-            continue
-        centroid = np.mean(np.stack(embs), axis=0)
-        centroid = centroid / np.linalg.norm(centroid)
-        centroids[spk] = centroid
-
-    if len(centroids) == 0:
-        return {spk: spk for spk in hyp_speakers}
-
-    # Cosine similarity: (n_clusters, n_enrol)
-    centroid_ids = sorted(centroids.keys())
-    centroid_matrix = np.stack([centroids[cid] for cid in centroid_ids])
-    sim_matrix = cosine_similarity(centroid_matrix, enrol_embs)
-
-    # Hungarian assignment
-    row_ind, col_ind = linear_sum_assignment(-sim_matrix)
-
-    mapping = {}
-    for r, c in zip(row_ind, col_ind):
-        mapping[centroid_ids[r]] = enrol_ids[c]
-
-    # Unmapped speakers keep original label
-    for spk in hyp_speakers:
-        if spk not in mapping:
-            mapping[spk] = spk
-
-    return mapping
-
-
-def _subseg_midpoint(subseg_id, frame_shift=10):
-    """Parse a sub-segment ID and return its time midpoint in seconds.
-
-    Sub-segment ID format:
-      {utt}-{begin_ms}-{end_ms}-{begin_frames}-{end_frames}
-
-    Args:
-      subseg_id: Sub-segment identifier string.
-      frame_shift: Frame shift in milliseconds.
-
-    Returns:
-      Midpoint time in seconds, or None if parsing fails.
-    """
-    parts = subseg_id.split('-')
-    if len(parts) < 5:
-        return None
-    try:
-        begin_ms = int(parts[-4])
-        begin_frames = int(parts[-2])
-        end_frames = int(parts[-1])
-        mid_frames = (begin_frames + end_frames) / 2.0
-        midpoint = (begin_ms + mid_frames * frame_shift) / 1000.0
-        return midpoint
-    except (ValueError, IndexError):
-        return None
-
-
-def _find_speaker_at_time(segments, time):
-    """Find which speaker is active at a given time.
-
-    Args:
-      segments: List of (start, end, speaker_label) tuples, sorted by
-        start time.
-      time: Time in seconds to query.
-
-    Returns:
-      Speaker label string, or None if no segment contains this time.
-    """
-    for start, end, spk in segments:
-        if start <= time <= end:
-            return spk
-        if start > time:
-            break
-    return None
 
 
 def _compute_rms_envelope(wav_path, start_time=None, end_time=None,

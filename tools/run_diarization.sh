@@ -37,6 +37,7 @@ pretrained_model=pretrained_models/voxceleb_resnet34_LM.onnx
 enrol_scp=""
 data_dir=""
 exp_label=""
+map_spk_ids=false   # map cluster labels to speaker IDs after RTTM writing
 
 . tools/parse_options.sh
 
