@@ -12,6 +12,7 @@ import soundfile as sf
 import torchaudio
 from scipy.signal import fftconvolve
 
+from wespeaker.utils.meeting_sim.noise import add_noise_to_buffer
 from wespeaker.utils.meeting_sim.room import beamform, select_stereo_mics
 
 
@@ -27,29 +28,25 @@ class MixConfig:
         'mono' (beamformed), 'stereo' (2-mic ~17 cm baseline),
         'multichannel' (all array mics). A single string is also accepted
         and normalised to a list. Defaults to ['mono'].
-      noise_wav: Optional path to background noise WAV file.
-      noise_snr_db: SNR for background noise mixing in dB.
       save_reverberant: Whether to save per-speaker reverberant signals.
       save_dry: Whether to save per-speaker dry (anechoic) signals.
     """
 
     def __init__(self, sample_rate=16000, output_channels=None,
-                 noise_wav=None, noise_snr_db=30.0, save_reverberant=False,
-                 save_dry=False):
+                 save_reverberant=False, save_dry=False):
         if output_channels is None:
             output_channels = ['mono']
         elif isinstance(output_channels, str):
             output_channels = [output_channels]
         self.sample_rate = sample_rate
         self.output_channels = output_channels
-        self.noise_wav = noise_wav
-        self.noise_snr_db = noise_snr_db
         self.save_reverberant = save_reverberant
         self.save_dry = save_dry
 
 
 def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
-                rng=None):
+                noise_multichannel=None, noise_snr_db=None, rng=None,
+                speaker_rms=None, target_rms=None):
     """Assemble all turns into meeting audio using room impulse responses.
 
     For each turn, loads the source audio, applies overlap energy
@@ -64,6 +61,11 @@ def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
       mix_cfg: MixConfig instance.
       speaker_index_map: Dict mapping speaker_id -> index into the rirs
         array (matching the order speakers were added to the room).
+      noise_multichannel: Optional np.ndarray of shape (n_mics,
+        n_samples) with unscaled multichannel noise. If provided,
+        noise_snr_db must also be set.
+      noise_snr_db: Target SNR in dB for noise mixing. Required if
+        noise_multichannel is provided.
       rng: numpy random Generator.
 
     Returns:
@@ -146,14 +148,28 @@ def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
     output_length = _find_last_nonzero(multichannel_buffer) + 1
     multichannel_buffer = multichannel_buffer[:, :output_length]
 
+    # Generate RTTM early (needed for noise SNR computation)
+    rttm = generate_rttm(turns, sample_rate)
+
+    # Add noise to multichannel buffer before output derivation
+    if noise_multichannel is not None and noise_snr_db is not None:
+        # Trim or pad noise to match output length
+        noise_len = noise_multichannel.shape[1]
+        if noise_len > output_length:
+            noise_multichannel = noise_multichannel[:, :output_length]
+        elif noise_len < output_length:
+            pad = np.zeros((noise_multichannel.shape[0],
+                            output_length - noise_len), dtype=np.float64)
+            noise_multichannel = np.concatenate(
+                [noise_multichannel, pad], axis=1)
+        add_noise_to_buffer(multichannel_buffer, noise_multichannel,
+                            noise_snr_db, rttm, sample_rate)
+
     # Build output dict
     result = {'n_samples': output_length}
 
     if 'mono' in mix_cfg.output_channels:
         mono = beamform(multichannel_buffer, meeting_room, sample_rate)
-        if mix_cfg.noise_wav is not None:
-            mono = add_background_noise(
-                mono, mix_cfg.noise_wav, mix_cfg.noise_snr_db, rng)
         result['mono'] = mono.astype(np.float32)
 
     if 'multichannel' in mix_cfg.output_channels:
@@ -175,7 +191,7 @@ def mix_meeting(turns, meeting_room, rirs, mix_cfg, speaker_index_map,
             sid: buf[:output_length].astype(np.float32)
             for sid, buf in dry_buffers.items()}
 
-    result['rttm'] = generate_rttm(turns, sample_rate)
+    result['rttm'] = rttm
 
     return result
 
@@ -310,49 +326,6 @@ def apply_overlap_energy(audio, overlap):
             audio[:fade_samples] *= fade_in
 
     return audio
-
-
-def add_background_noise(signal, noise_path, snr_db, rng=None):
-    """Mix background noise into the signal at a target SNR.
-
-    Args:
-      signal: np.ndarray of the clean signal.
-      noise_path: Path to noise WAV file.
-      snr_db: Target signal-to-noise ratio in dB.
-      rng: numpy random Generator.
-
-    Returns:
-      np.ndarray of the noisy signal.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    noise, noise_sr = sf.read(noise_path, dtype='float32')
-    if noise.ndim > 1:
-        noise = noise.mean(axis=1)
-
-    # Repeat noise if shorter than signal
-    while len(noise) < len(signal):
-        noise = np.concatenate([noise, noise])
-    # Random offset and trim
-    max_offset = len(noise) - len(signal)
-    if max_offset > 0:
-        offset = rng.integers(0, max_offset)
-        noise = noise[offset:offset + len(signal)]
-    else:
-        noise = noise[:len(signal)]
-
-    # Scale noise to achieve target SNR
-    signal_power = np.mean(signal ** 2)
-    noise_power = np.mean(noise ** 2)
-    if noise_power < 1e-10:
-        return signal
-
-    target_noise_power = signal_power / (10 ** (snr_db / 10))
-    scale = np.sqrt(target_noise_power / noise_power)
-    noisy_signal = signal + scale * noise
-
-    return noisy_signal.astype(np.float32)
 
 
 def generate_rttm(turns, sample_rate):

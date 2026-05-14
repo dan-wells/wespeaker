@@ -58,8 +58,13 @@ output:
 
 noise:
   enabled: false
-  wav_path: null
-  snr_db: 30.0
+  source: inside         # inside, outside, or diffuse
+  snr_db: 20.0
+  audio: null            # path to wav file, directory of wavs, or text file listing wav paths
+  fill_mode: repeat      # repeat, concatenate, or concatenate-gaps
+  wall_cutoff_hz: 1200   # Butterworth cutoff for outside mode
+  wall_filter_order: 2   # Butterworth order for outside mode
+  unique_across_meetings: false  # draw without replacement across meetings (n_workers=1 only)
 
 batch:
   n_meetings: 10

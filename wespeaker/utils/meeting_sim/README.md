@@ -232,11 +232,27 @@ Overlap types (distributed according to `overlap_weights`):
 
 ### `noise`
 
-| Key       | Default | Description                                   |
-|-----------|---------|-----------------------------------------------|
-| `enabled` | false   | Whether to add background noise               |
-| `wav_path`| null    | Path to noise WAV file                        |
-| `snr_db`  | 30.0    | Target signal-to-noise ratio in dB            |
+| Key                | Default  | Description                                          |
+|--------------------|----------|------------------------------------------------------|
+| `enabled`          | false    | Whether to add background noise                      |
+| `source`           | inside   | Noise mode: `inside`, `outside`, or `diffuse`        |
+| `snr_db`           | 20.0     | Target signal-to-noise ratio in dB                   |
+| `audio`            | null     | Path to noise WAV, directory of WAVs, or text file listing paths |
+| `fill_mode`        | repeat   | `repeat` (tile one file), `concatenate` (join with crossfade), or `concatenate-gaps` (join with 5-20 s silence gaps) |
+| `wall_cutoff_hz`   | 1200     | Butterworth low-pass cutoff for `outside` mode (Hz)  |
+| `wall_filter_order`| 2        | Butterworth filter order for `outside` mode          |
+| `unique_across_meetings`| false | Draw without replacement across meetings (`n_workers: 1` only) |
+
+When enabled, noise audio from the specified files is mixed into simulated meetings, with the noise source and spatial characteristics determined by `noise.source`:
+
+- `inside`: point source placed inside the room near a wall, convolved with the room RIR.
+  Suitable for directional noise originating within the meeting space -- e.g. a projector fan, a printer, an air conditioning unit on the wall.
+- `outside`: point source with a Butterworth low-pass filter applied before RIR convolution to simulate wall transmission loss.
+  Suitable for noise from adjacent spaces -- e.g. traffic outside a window, music or speech from a neighbouring room, corridor foot traffic, construction work outside the building.
+- `diffuse`: spatially correlated noise across the mic array using the sinc coherence model (overlap-add with Cholesky-factored coherence matrices).
+  Suitable for ambient environmental noise with no dominant direction -- e.g. general ventilation/HVAC hum, distant city noise, rain on the roof, babble from a crowded open-plan office.
+
+If multiple noise files are provided, either in a directory or via a file list, they are randomly sampled per meeting and combined according to `fill_mode`.
 
 ### `batch`
 
@@ -392,11 +408,11 @@ from wespeaker.utils.meeting_sim.turns import (
 ```python
 from wespeaker.utils.meeting_sim.mixer import (
     MixConfig, mix_meeting, write_meeting_outputs,
-    generate_rttm, write_rttm, add_background_noise,
+    generate_rttm, write_rttm,
 )
 ```
 
-**`MixConfig(sample_rate=16000, output_channels=None, noise_wav=None, noise_snr_db=30.0, save_reverberant=False, save_dry=False)`**
+**`MixConfig(sample_rate=16000, output_channels=None, save_reverberant=False, save_dry=False)`**
   Controls mixing behaviour and which outputs to produce.
   `output_channels` is a list of `'mono'`, `'stereo'`, and/or `'multichannel'`; a bare string is also accepted. Defaults to `['mono']`.
 
@@ -411,8 +427,37 @@ from wespeaker.utils.meeting_sim.mixer import (
 **`generate_rttm(turns, sample_rate)`**
   Extract `(speaker_id, start_s, duration_s)` tuples from turns.
 
-**`add_background_noise(signal, noise_path, snr_db, rng)`**
-  Mix noise at a target SNR.
+### `wespeaker.utils.meeting_sim.noise`
+
+```python
+from wespeaker.utils.meeting_sim.noise import (
+    NoiseConfig, load_noise_audio, pick_noise_position,
+    apply_wall_filter, generate_diffuse_noise,
+    extract_noise_rir, convolve_noise_with_rir,
+    add_noise_to_buffer,
+)
+```
+
+**`NoiseConfig.from_dict(cfg_dict)`**
+  Build from the `noise:` section of the YAML config.
+
+**`load_noise_audio(noise_cfg, duration_samples, sample_rate, rng, used_paths=None)`**
+  Load and assemble noise audio to cover the meeting duration.
+  Supports `repeat`, `concatenate`, and `concatenate-gaps` fill modes.
+  Returns `(audio, consumed_paths)` where `consumed_paths` is a list of the files actually loaded, in load order.
+  Pass a `used_paths` set to track consumed files across calls (for `unique_across_meetings`).
+
+**`pick_noise_position(room_cfg, source_mode, rng)`**
+  Pick a random position near a room wall (excludes the mic wall).
+
+**`apply_wall_filter(audio, cutoff_hz, order, sample_rate)`**
+  Butterworth low-pass for wall transmission simulation.
+
+**`generate_diffuse_noise(mono_noise, array_cfg, sample_rate, rng)`**
+  Generate spatially correlated multichannel noise from a mono input.
+
+**`add_noise_to_buffer(multichannel_buffer, noise_multichannel, snr_db, rttm, sample_rate)`**
+  Scale noise to target SNR (computed over speech-active regions) and add in-place.
 
 
 ## Design Decisions
@@ -502,6 +547,18 @@ List-valued vary specs cycle deterministically (round-robin by meeting index) to
 
 All randomness flows through explicit `numpy.random.Generator` instances seeded from `base_seed + meeting_idx`.
 This means a given (config, seed, meeting_index) triple always produces the same output regardless of batch size or parallelism level.
+
+Within a meeting, the single RNG is consumed sequentially:
+
+1. Jitter application (`batch.vary`)
+2. Room creation (speaker position jitter)
+3. Speaker selection
+4. Turn construction
+5. Noise generation (position, audio loading)
+
+Because `_apply_jitter` draws from the RNG for every numeric entry in `batch.vary` (in YAML insertion order), adding, removing, or reordering vary entries changes the RNG state seen by all downstream steps.
+This means that modifying `batch.vary` in an existing config -- even for unrelated parameters like noise -- will change speaker selections and room geometry for the same seed.
+To reproduce previous results exactly, keep the `batch.vary` block unchanged.
 
 
 ## Dependencies

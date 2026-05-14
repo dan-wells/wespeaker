@@ -22,7 +22,7 @@ import yaml
 from wespeaker.utils.cli import validate_fire_args
 from wespeaker.utils.meeting_sim.speakers import (
     build_speaker_pool, cluster_speakers, compute_vad_segments,
-    select_speakers, find_subgroup_positions,
+    compute_speaker_rms, select_speakers, find_subgroup_positions,
     save_pool, load_pool,
 )
 from wespeaker.utils.meeting_sim.turns import build_turn_sequence
@@ -31,6 +31,11 @@ from wespeaker.utils.meeting_sim.room import (
 )
 from wespeaker.utils.meeting_sim.mixer import (
     MixConfig, mix_meeting, write_meeting_outputs,
+)
+from wespeaker.utils.meeting_sim.noise import (
+    NoiseConfig, load_noise_audio, pick_noise_position,
+    apply_wall_filter, generate_diffuse_noise, extract_noise_rir,
+    convolve_noise_with_rir,
 )
 
 
@@ -116,7 +121,8 @@ def _apply_jitter(cfg, vary_spec, rng, meeting_idx=0):
 
 
 def _generate_single_meeting(meeting_idx, pool, cfg, base_seed,
-                             used_speaker_ids=None):
+                             used_speaker_ids=None,
+                             used_noise_files=None):
     """Generate a single meeting (called per-meeting in the batch loop).
 
     Args:
@@ -127,6 +133,9 @@ def _generate_single_meeting(meeting_idx, pool, cfg, base_seed,
       used_speaker_ids: Optional set of speaker IDs already used in
         this batch (for without-replacement selection in random mode).
         Selected speakers are added to this set in-place.
+      used_noise_files: Optional set of noise file paths already used
+        in this batch (for unique_across_meetings). Consumed paths
+        are added to this set in-place.
 
     Returns:
       Tuple of (meeting_idx, meeting_id, metadata_dict).
@@ -226,24 +235,68 @@ def _generate_single_meeting(meeting_idx, pool, cfg, base_seed,
         rng=rng,
     )
 
-    # Compute RIRs
+    # Prepare noise source (add to room before computing RIRs)
+    noise_cfg = NoiseConfig.from_dict(meeting_cfg.get('noise'))
+    noise_multichannel = None
+    noise_position = None
+    noise_src_idx = None
+    noise_files_used = None
+
+    if noise_cfg.enabled and noise_cfg.audio is not None:
+        if noise_cfg.source in ('inside', 'outside'):
+            noise_position = pick_noise_position(
+                room_cfg, noise_cfg.source, rng)
+            noise_src_idx = len(meeting_room.room.sources)
+            meeting_room.room.add_source(
+                noise_position, signal=np.zeros(1))
+
+    # Compute RIRs (includes noise source if added above)
     rirs = compute_rirs(meeting_room, sample_rate)
+
+    # Generate multichannel noise
+    if noise_cfg.enabled and noise_cfg.audio is not None:
+        # Estimate duration for noise audio loading
+        max_end = 0
+        for turn in turns:
+            turn_end = (turn.meeting_onset_sample
+                        + turn.segment.duration_samples)
+            max_end = max(max_end, turn_end)
+        noise_duration_samples = max_end + rirs.shape[2]
+
+        mono_noise, noise_files_used = load_noise_audio(
+            noise_cfg, noise_duration_samples, sample_rate, rng,
+            used_paths=used_noise_files)
+
+        if noise_cfg.source in ('inside', 'outside'):
+            if noise_cfg.source == 'outside':
+                mono_noise = apply_wall_filter(
+                    mono_noise, noise_cfg.wall_cutoff_hz,
+                    noise_cfg.wall_filter_order, sample_rate)
+            noise_rir = extract_noise_rir(
+                meeting_room.room, noise_src_idx, array_cfg.n_mics)
+            noise_multichannel = convolve_noise_with_rir(
+                mono_noise, noise_rir)
+        elif noise_cfg.source == 'diffuse':
+            noise_multichannel = generate_diffuse_noise(
+                mono_noise, array_cfg, sample_rate, rng)
 
     # Mix meeting
     output_cfg = meeting_cfg.get('output', {})
-    noise_cfg = meeting_cfg.get('noise', {})
     mix_cfg = MixConfig(
         sample_rate=sample_rate,
         output_channels=output_cfg.get('channels', ['mono']),
-        noise_wav=(noise_cfg.get('wav_path')
-                   if noise_cfg.get('enabled') else None),
-        noise_snr_db=noise_cfg.get('snr_db', 30.0),
         save_reverberant=output_cfg.get('save_reverberant', False),
         save_dry=output_cfg.get('save_dry', False),
     )
 
     result = mix_meeting(
-        turns, meeting_room, rirs, mix_cfg, speaker_index_map, rng)
+        turns, meeting_room, rirs, mix_cfg, speaker_index_map,
+        noise_multichannel=noise_multichannel,
+        noise_snr_db=noise_cfg.snr_db if noise_multichannel is not None
+        else None,
+        rng=rng,
+        speaker_rms=speaker_rms,
+        target_rms=target_rms)
 
     # Compute pairwise similarities between selected speakers
     id_to_idx = {sid: i for i, sid in enumerate(pool.speaker_ids)}
@@ -294,6 +347,8 @@ def _generate_single_meeting(meeting_idx, pool, cfg, base_seed,
         'silence_ratio': round(silence_ratio, 4),
         'bursts': burst_stats,
         'duration_s': duration_s,
+        'noise': _build_noise_metadata(
+            noise_cfg, noise_position, noise_files_used),
     }
 
     return meeting_idx, meeting_id, result, metadata, mix_cfg
@@ -423,9 +478,14 @@ class MeetingSimulator:
             and speakers_cfg.get('similarity_mode', 'random') == 'random'
         )
 
+        # Without-replacement noise file selection
+        noise_cfg = NoiseConfig.from_dict(cfg.get('noise'))
+        use_unique_noise = noise_cfg.unique_across_meetings
+
         if n_workers <= 1:
             # Sequential generation
             used_speaker_ids = set() if use_unique else None
+            used_noise_files = set() if use_unique_noise else None
             n_spk = speakers_cfg.get('n_speakers', 3)
             for i in range(n_meetings):
                 # Reset used set when pool is exhausted
@@ -438,7 +498,8 @@ class MeetingSimulator:
                     used_speaker_ids.clear()
                 idx, mid, result, metadata, mix_cfg = (
                     _generate_single_meeting(
-                        i, pool, cfg, base_seed, used_speaker_ids))
+                        i, pool, cfg, base_seed, used_speaker_ids,
+                        used_noise_files))
                 meeting_dir = os.path.join(output_dir, 'meetings', mid)
                 write_meeting_outputs(result, meeting_dir, mid, mix_cfg)
                 _write_metadata(metadata, meeting_dir)
@@ -450,6 +511,10 @@ class MeetingSimulator:
             if use_unique:
                 logger.warning(
                     "unique_across_meetings requires n_workers=1; "
+                    "ignoring with %d workers.", n_workers)
+            if use_unique_noise:
+                logger.warning(
+                    "noise.unique_across_meetings requires n_workers=1; "
                     "ignoring with %d workers.", n_workers)
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
                 futures = {}
@@ -624,6 +689,37 @@ class MeetingSimulator:
         for i, pos in enumerate(meeting_room.speaker_positions):
             print("  Speaker %d: (%.2f, %.2f, %.2f)" % (
                 i, pos[0], pos[1], pos[2]))
+
+
+def _build_noise_metadata(noise_cfg, noise_position, noise_files=None):
+    """Build noise metadata dict for the meeting metadata.
+
+    Args:
+      noise_cfg: NoiseConfig instance.
+      noise_position: np.ndarray of noise source position (3D), or None
+        for diffuse noise.
+      noise_files: Sorted list of noise file paths actually used for
+        this meeting, or None if noise was not loaded.
+
+    Returns:
+      Dict with noise configuration details, or None if noise is
+        disabled.
+    """
+    if not noise_cfg.enabled or noise_cfg.audio is None:
+        return None
+
+    metadata = {
+        'source': noise_cfg.source,
+        'snr_db': noise_cfg.snr_db,
+        'files': noise_files or [],
+        'fill_mode': noise_cfg.fill_mode,
+    }
+    if noise_position is not None:
+        metadata['position'] = noise_position.tolist()
+    if noise_cfg.source == 'outside':
+        metadata['wall_cutoff_hz'] = noise_cfg.wall_cutoff_hz
+        metadata['wall_filter_order'] = noise_cfg.wall_filter_order
+    return metadata
 
 
 def _compute_overlap_duration(rttm):
