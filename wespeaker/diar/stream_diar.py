@@ -29,6 +29,7 @@ import time
 import kaldiio
 import numpy as np
 import silero_vad
+import sounddevice as sd
 import torch
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
@@ -40,6 +41,56 @@ from wespeaker.diar.make_rttm import merge_segments
 
 
 SAMPLE_RATE = 16000
+
+
+class AudioRingBuffer:
+    """Fixed-size circular buffer for streaming audio samples.
+
+    Pre-allocates a numpy array of the given capacity and supports
+    efficient append and retrieval of the most recent samples without
+    per-stride allocation.
+
+    Args:
+      capacity: Maximum number of samples to store.
+    """
+
+    def __init__(self, capacity):
+        self.buffer = np.zeros(capacity, dtype=np.float32)
+        self.capacity = capacity
+        self.write_pos = 0
+
+    def append(self, data):
+        """Append samples to the buffer, overwriting oldest if full."""
+        n = len(data)
+        if n >= self.capacity:
+            self.buffer[:] = data[-self.capacity:]
+            self.write_pos += n
+            return
+        start = self.write_pos % self.capacity
+        end = start + n
+        if end <= self.capacity:
+            self.buffer[start:end] = data
+        else:
+            first = self.capacity - start
+            self.buffer[start:] = data[:first]
+            self.buffer[:n - first] = data[first:]
+        self.write_pos += n
+
+    def get_last_n(self, n):
+        """Return the last n samples as a contiguous array."""
+        available = min(n, self.write_pos, self.capacity)
+        end = self.write_pos % self.capacity
+        if available <= end:
+            return self.buffer[end - available:end].copy()
+        else:
+            return np.concatenate(
+                [self.buffer[self.capacity - (available - end):],
+                 self.buffer[:end]])
+
+    @property
+    def total_samples(self):
+        """Total number of samples written since creation."""
+        return self.write_pos
 
 
 class RawDefaultsFormatter(
@@ -251,6 +302,67 @@ def load_audio(wav_path):
     return signal.squeeze(0).numpy()
 
 
+def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
+                  vad_model, args, window_frames):
+    """Process a single audio chunk: VAD, fbank, embedding, assignment.
+
+    Args:
+      chunk: np.ndarray of shape (n_samples,), float32, 16kHz.
+      start_sec: Start time of this chunk in seconds.
+      end_sec: End time of this chunk in seconds.
+      emb_model: EmbeddingModel instance.
+      assigner: OnlineClusterer or SpeakerIdentifier instance.
+      vad_model: Silero VAD model, or None if VAD is disabled.
+      args: Parsed CLI arguments.
+      window_frames: Expected number of fbank frames for a full window.
+
+    Returns:
+      Tuple of (start_sec, end_sec, label, confidence) if speech is
+        detected and above threshold, else None.
+    """
+    # VAD gate
+    if vad_model is not None:
+        vad_model.reset_states()
+        chunk_tensor = torch.from_numpy(chunk).float()
+        timestamps = silero_vad.get_speech_timestamps(
+            chunk_tensor, vad_model,
+            sampling_rate=SAMPLE_RATE,
+            threshold=args.vad_threshold)
+        if not timestamps:
+            if not args.quiet:
+                print("%8.3f %8.3f  --" % (start_sec, end_sec))
+                sys.stdout.flush()
+            return None
+
+    # Compute fbank features and apply per-window CMN
+    fbank = compute_fbank_for_chunk(chunk)
+    if args.subseg_cmn:
+        fbank = fbank - fbank.mean(axis=0)
+
+    # Pad short chunks to expected window length (matches offline
+    # np.resize behavior in extract_emb.subsegment)
+    if fbank.shape[0] < window_frames:
+        fbank = np.resize(fbank, (window_frames, fbank.shape[1]))
+
+    # Extract embedding and assign speaker
+    embedding = emb_model.extract(fbank)
+    label, confidence = assigner.assign(embedding)
+
+    # Apply assignment threshold
+    if (args.assign_threshold is not None
+            and confidence < args.assign_threshold):
+        if not args.quiet:
+            print("%8.3f %8.3f  --" % (start_sec, end_sec))
+            sys.stdout.flush()
+        return None
+
+    if not args.quiet:
+        print("%8.3f %8.3f  %s  %.2f"
+              % (start_sec, end_sec, label, confidence))
+        sys.stdout.flush()
+    return (start_sec, end_sec, label, confidence)
+
+
 def process_file(audio, utt_id, emb_model, assigner, vad_model, args):
     """Run streaming diarization on a single audio file.
 
@@ -296,55 +408,89 @@ def process_file(audio, utt_id, emb_model, assigner, vad_model, args):
             pos += stride_samples
             continue
 
-        # VAD gate
-        if vad_model is not None:
-            vad_model.reset_states()
-            chunk_tensor = torch.from_numpy(chunk).float()
-            timestamps = silero_vad.get_speech_timestamps(
-                chunk_tensor, vad_model,
-                sampling_rate=SAMPLE_RATE,
-                threshold=args.vad_threshold)
-            if not timestamps:
-                if not args.quiet:
-                    print("%8.3f %8.3f  --" % (start_sec, end_sec))
-                    sys.stdout.flush()
-                pos += stride_samples
-                if args.real_time:
-                    elapsed = time.monotonic() - t0
-                    time.sleep(max(0, args.stride_secs - elapsed))
-                continue
-
-        # Compute fbank features and apply per-window CMN
-        fbank = compute_fbank_for_chunk(chunk)
-        if args.subseg_cmn:
-            fbank = fbank - fbank.mean(axis=0)
-
-        # Pad short chunks to expected window length (matches offline
-        # np.resize behavior in extract_emb.subsegment)
-        if fbank.shape[0] < window_frames:
-            fbank = np.resize(fbank, (window_frames, fbank.shape[1]))
-
-        # Extract embedding and assign speaker
-        embedding = emb_model.extract(fbank)
-        label, confidence = assigner.assign(embedding)
-
-        # Apply assignment threshold
-        if (args.assign_threshold is not None
-                and confidence < args.assign_threshold):
-            if not args.quiet:
-                print("%8.3f %8.3f  --" % (start_sec, end_sec))
-                sys.stdout.flush()
-        else:
-            results.append((start_sec, end_sec, label, confidence))
-            if not args.quiet:
-                print("%8.3f %8.3f  %s  %.2f"
-                      % (start_sec, end_sec, label, confidence))
-                sys.stdout.flush()
+        result = process_chunk(
+            chunk, start_sec, end_sec,
+            emb_model, assigner, vad_model, args, window_frames)
+        if result is not None:
+            results.append(result)
 
         pos += stride_samples
         if args.real_time:
             elapsed = time.monotonic() - t0
             time.sleep(max(0, args.stride_secs - elapsed))
+
+    return results
+
+
+def process_device_stream(utt_id, emb_model, assigner, vad_model, args):
+    """Run streaming diarization on live audio from a device input.
+
+    Opens an audio input stream, reads chunks of stride_secs duration,
+    and processes each through the same VAD/fbank/embedding/assignment
+    pipeline as file-based mode. Runs until interrupted with Ctrl+C.
+
+    Args:
+      utt_id: Utterance identifier string.
+      emb_model: EmbeddingModel instance.
+      assigner: OnlineClusterer or SpeakerIdentifier instance.
+      vad_model: Silero VAD model, or None if VAD is disabled.
+      args: Parsed CLI arguments.
+
+    Returns:
+      List of (start_sec, end_sec, label, confidence) tuples.
+    """
+    window_samples = int(args.window_secs * SAMPLE_RATE)
+    stride_samples = int(args.stride_secs * SAMPLE_RATE)
+    window_frames = int(args.window_secs * 1000) // 10
+
+    results = []
+    ring_buf = AudioRingBuffer(window_samples)
+
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=stride_samples,
+        device=args.audio_device)
+
+    try:
+        stream.start()
+        if not args.quiet:
+            print("--- %s (device %d) ---" % (utt_id, args.audio_device))
+            print("Listening... press Ctrl+C to stop.")
+            sys.stdout.flush()
+
+        while True:
+            data, overflowed = stream.read(stride_samples)
+            if overflowed:
+                print("[WARNING] audio input overflowed", file=sys.stderr)
+
+            ring_buf.append(data[:, 0])
+
+            # Determine how much audio is available
+            available = min(ring_buf.total_samples, window_samples)
+            chunk = ring_buf.get_last_n(available)
+
+            end_sec = ring_buf.total_samples / SAMPLE_RATE
+            start_sec = (ring_buf.total_samples - available) / SAMPLE_RATE
+
+            if available < stride_samples:
+                continue
+            if args.wait_full_buffer and available < window_samples:
+                continue
+
+            result = process_chunk(
+                chunk, start_sec, end_sec,
+                emb_model, assigner, vad_model, args, window_frames)
+            if result is not None:
+                results.append(result)
+
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print("\nStopping...")
+    finally:
+        stream.stop()
+        stream.close()
 
     return results
 
@@ -355,13 +501,20 @@ def get_args():
         formatter_class=RawDefaultsFormatter)
 
     # Input
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--wav", help="single wav file path")
     input_group.add_argument("--wav-scp",
                              help="wav.scp for sequential processing")
+    input_group.add_argument("--audio-device", type=int, default=None,
+                             metavar="DEVICE_ID",
+                             help="audio input device index for live capture")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="list available audio devices and exit")
+    parser.add_argument("--utt-id", default="stream",
+                        help="utterance ID for device input mode")
 
     # Model
-    parser.add_argument("--model", required=True,
+    parser.add_argument("--model", default=None,
                         help="path to .onnx file or PyTorch model directory")
     parser.add_argument("--backend", default=None,
                         choices=["onnx", "pytorch"],
@@ -406,7 +559,7 @@ def get_args():
                         help="speech probability threshold for VAD")
 
     # Output
-    parser.add_argument("--output", required=True,
+    parser.add_argument("--output", default=None,
                         help="output labels file path")
     parser.add_argument("--output-rttm", default=None,
                         help="optional RTTM output path")
@@ -420,6 +573,16 @@ def get_args():
 
     args = parser.parse_args()
 
+    if args.list_devices:
+        return args
+
+    if args.wav is None and args.wav_scp is None and args.audio_device is None:
+        parser.error(
+            "one of --wav, --wav-scp, or --audio-device is required")
+    if args.model is None:
+        parser.error("--model is required")
+    if args.output is None:
+        parser.error("--output is required")
     if args.assign == "identify" and args.enrol_scp is None:
         parser.error("--enrol-scp is required when --assign identify")
 
@@ -428,6 +591,10 @@ def get_args():
 
 def main():
     args = get_args()
+
+    if args.list_devices:
+        print(sd.query_devices())
+        return
 
     emb_model = EmbeddingModel(args.model, args.device, args.backend)
 
@@ -440,32 +607,44 @@ def main():
     if args.vad:
         vad_model = silero_vad.load_silero_vad()
 
-    # Build file list from single wav or wav.scp
-    if args.wav is not None:
-        utt_id = os.path.splitext(os.path.basename(args.wav))[0]
-        file_list = [(utt_id, args.wav)]
-    else:
-        file_list = []
-        with open(args.wav_scp) as f:
-            for line in f:
-                parts = line.strip().split(maxsplit=1)
-                file_list.append((parts[0], parts[1]))
-
     all_results = {}
-    for utt_id, wav_path in file_list:
-        #if not args.quiet:
-        print("--- %s ---" % utt_id)
 
-        audio = load_audio(wav_path)
+    if args.audio_device is not None:
+        utt_id = args.utt_id
 
         if args.assign == "cluster":
             assigner.reset()
         else:
             assigner.setup_for_file(utt_id)
 
-        results = process_file(
-            audio, utt_id, emb_model, assigner, vad_model, args)
+        results = process_device_stream(
+            utt_id, emb_model, assigner, vad_model, args)
         all_results[utt_id] = results
+    else:
+        # Build file list from single wav or wav.scp
+        if args.wav is not None:
+            utt_id = os.path.splitext(os.path.basename(args.wav))[0]
+            file_list = [(utt_id, args.wav)]
+        else:
+            file_list = []
+            with open(args.wav_scp) as f:
+                for line in f:
+                    parts = line.strip().split(maxsplit=1)
+                    file_list.append((parts[0], parts[1]))
+
+        for utt_id, wav_path in file_list:
+            print("--- %s ---" % utt_id)
+
+            audio = load_audio(wav_path)
+
+            if args.assign == "cluster":
+                assigner.reset()
+            else:
+                assigner.setup_for_file(utt_id)
+
+            results = process_file(
+                audio, utt_id, emb_model, assigner, vad_model, args)
+            all_results[utt_id] = results
 
     # Write labels file
     output_dir = os.path.dirname(args.output)
