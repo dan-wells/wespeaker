@@ -37,6 +37,7 @@ pretrained_model=pretrained_models/voxceleb_resnet34_LM.onnx
 enrol_scp=""
 data_dir=""
 exp_label=""
+assign_threshold=""  # min cosine similarity for speaker assignment; omit low-confidence subsegments
 map_spk_ids=false   # map cluster labels to speaker IDs after RTTM writing
 
 . tools/parse_options.sh
@@ -174,7 +175,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
         python3 wespeaker/diar/${cluster_type}_clusterer.py \
                 --scp ${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp \
                 --output ${labels_file} \
-                ${utt2num_spks:+--utt2num_spks ${utt2num_spks}}
+                ${utt2num_spks:+--utt2num_spks ${utt2num_spks}} \
+                ${assign_threshold:+--threshold ${assign_threshold}}
 
     elif [ "$assign_type" == "identify" ]; then
         if [ -z "$enrol_scp" ]; then
@@ -185,7 +187,8 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
                 --scp ${data_dir}/${exp}/${sad_type}_sad_embedding/emb.scp \
                 --enrol-scp ${enrol_scp} \
                 --metadata-dir ${data_dir}/meetings \
-                --output ${labels_file}
+                --output ${labels_file} \
+                ${assign_threshold:+--threshold ${assign_threshold}}
 
     elif [ "$assign_type" == "beamform" ]; then
         beamform_args="--wav-scp ${data_dir}/wav_multichannel.scp \

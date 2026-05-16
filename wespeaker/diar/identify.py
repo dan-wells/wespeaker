@@ -65,7 +65,10 @@ def identify(embeddings, gallery_embeddings, speaker_ids):
         gallery_embeddings rows.
 
     Returns:
-      List of speaker ID strings, one per subsegment.
+      Tuple of (labels, max_scores) where labels is a list of speaker
+        ID strings and max_scores is an np.ndarray of shape
+        (n_subsegs,) with the max cosine similarity for each
+        assignment.
     """
     # L2-normalize
     emb_norm = embeddings / np.linalg.norm(
@@ -76,7 +79,9 @@ def identify(embeddings, gallery_embeddings, speaker_ids):
     # Cosine similarity matrix: (n_subsegs, n_speakers)
     scores = emb_norm @ gal_norm.T
     best_indices = np.argmax(scores, axis=1)
-    return [speaker_ids[i] for i in best_indices]
+    max_scores = np.max(scores, axis=1)
+    labels = [speaker_ids[i] for i in best_indices]
+    return labels, max_scores
 
 
 class RawDefaultsHelpFormatter(
@@ -97,6 +102,9 @@ def get_args():
                         help='directory containing per-meeting metadata.json')
     parser.add_argument('--output', required=True,
                         help='output label file')
+    parser.add_argument('--threshold', type=float, default=None,
+                        help='min cosine similarity for assignment; '
+                             'subsegments below this are omitted')
     args = parser.parse_args()
     return args
 
@@ -129,9 +137,12 @@ def main():
                 [enrol_dict[spk_id] for spk_id in speaker_ids])
 
             # Identify speakers
-            labels = identify(embeddings, gallery_embeddings, speaker_ids)
+            labels, max_scores = identify(
+                embeddings, gallery_embeddings, speaker_ids)
 
-            for subseg, label in zip(subsegs, labels):
+            for subseg, label, score in zip(subsegs, labels, max_scores):
+                if args.threshold is not None and score < args.threshold:
+                    continue
                 print(subseg, label, file=f)
 
 

@@ -86,6 +86,30 @@ def cluster(embeddings, num_spks=None, min_num_spks=1, max_num_spks=20, p=.01):
     return labels
 
 
+def compute_assignment_scores(embeddings, labels):
+    """Compute cosine similarity of each embedding to its cluster centroid.
+
+    Args:
+      embeddings: np.ndarray of shape (n_subsegs, emb_dim).
+      labels: List/array of integer cluster labels, length n_subsegs.
+
+    Returns:
+      np.ndarray of shape (n_subsegs,) with cosine similarity scores.
+    """
+    labels = np.asarray(labels)
+    centroids = {}
+    for lab in np.unique(labels):
+        centroid = embeddings[labels == lab].mean(axis=0)
+        centroid = centroid / np.linalg.norm(centroid)
+        centroids[lab] = centroid
+
+    emb_norm = embeddings / np.linalg.norm(
+        embeddings, axis=1, keepdims=True)
+    scores = np.array([emb_norm[i] @ centroids[labels[i]]
+                       for i in range(len(labels))])
+    return scores
+
+
 def read_emb(scp):
     emb_dict = OrderedDict()
     for sub_seg_id, emb in kaldiio.load_scp_sequential(scp):
@@ -119,6 +143,9 @@ def get_args():
     parser.add_argument('--output', required=True, help='output label file')
     parser.add_argument('--utt2num_spks', type=str, default=None,
                         help='file mapping utterance ID to number of speakers (optional)')
+    parser.add_argument('--threshold', type=float, default=None,
+                        help='min cosine similarity to cluster centroid for '
+                             'assignment; subsegments below this are omitted')
     args = parser.parse_args()
     return args
 
@@ -131,12 +158,15 @@ def main():
                      for subseg in subsegs_list]
     validate_path(args.output)
     with cf.ProcessPoolExecutor() as executor, open(args.output, 'w') as f:
-        for (subsegs, labels) in zip(subsegs_list,
-                                     executor.map(cluster, embeddings_list, num_spks_list)):
-            [
+        for (subsegs, embeddings, labels) in zip(
+                subsegs_list, embeddings_list,
+                executor.map(cluster, embeddings_list, num_spks_list)):
+            if args.threshold is not None:
+                scores = compute_assignment_scores(embeddings, labels)
+            for i, (subseg, label) in enumerate(zip(subsegs, labels)):
+                if args.threshold is not None and scores[i] < args.threshold:
+                    continue
                 print(subseg, label, file=f)
-                for (subseg, label) in zip(subsegs, labels)
-            ]
 
 
 if __name__ == '__main__':

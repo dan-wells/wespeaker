@@ -179,6 +179,30 @@ class PAHC:
         return x / np.linalg.norm(x, axis=axis, keepdims=keepdims)
 
 
+def compute_assignment_scores(embeddings, labels):
+    """Compute cosine similarity of each embedding to its cluster centroid.
+
+    Args:
+      embeddings: np.ndarray of shape (n_subsegs, emb_dim).
+      labels: List/array of integer cluster labels, length n_subsegs.
+
+    Returns:
+      np.ndarray of shape (n_subsegs,) with cosine similarity scores.
+    """
+    labels = np.asarray(labels)
+    centroids = {}
+    for lab in np.unique(labels):
+        centroid = embeddings[labels == lab].mean(axis=0)
+        centroid = centroid / np.linalg.norm(centroid)
+        centroids[lab] = centroid
+
+    emb_norm = embeddings / np.linalg.norm(
+        embeddings, axis=1, keepdims=True)
+    scores = np.array([emb_norm[i] @ centroids[labels[i]]
+                       for i in range(len(labels))])
+    return scores
+
+
 def get_args():
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--scp', required=True, help='embedding scp')
@@ -199,6 +223,9 @@ def get_args():
     parser.add_argument('--min_dist', required=False, default=0.05,
                         help="The minimum distance between points in "
                              "the low dimensional representation.")
+    parser.add_argument('--threshold', type=float, default=None,
+                        help='min cosine similarity to cluster centroid for '
+                             'assignment; subsegments below this are omitted')
     args = parser.parse_args()
     return args
 
@@ -259,9 +286,12 @@ if __name__ == '__main__':
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
         with open(args.output, 'w') as fd:
-            for (subsegs, labels) in zip(subsegs_list,
-                                         executor.map(run_cluster,
-                                                      embeddings_list)):
-                [print(subseg,
-                       label,
-                       file=fd) for (subseg, label) in zip(subsegs, labels)]
+            for (subsegs, embeddings, labels) in zip(
+                    subsegs_list, embeddings_list,
+                    executor.map(run_cluster, embeddings_list)):
+                if args.threshold is not None:
+                    scores = compute_assignment_scores(embeddings, labels)
+                for i, (subseg, label) in enumerate(zip(subsegs, labels)):
+                    if args.threshold is not None and scores[i] < args.threshold:
+                        continue
+                    print(subseg, label, file=fd)
