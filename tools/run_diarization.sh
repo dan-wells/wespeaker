@@ -38,6 +38,7 @@ enrol_scp=""
 data_dir=""
 exp_label=""
 assign_threshold=""  # min cosine similarity for speaker assignment; omit low-confidence subsegments
+score_overlap=true  # if false, strip overlap regions from ref before scoring (hyp speech in overlap = false alarm)
 map_spk_ids=false   # map cluster labels to speaker IDs after RTTM writing
 
 . tools/parse_options.sh
@@ -254,5 +255,44 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
                  -s <(grep "${file_name}" ${data_dir}/${exp}/${sad_type}_sad_rttm) > ${single_file_res_dir}/${file_name}_res
         done
         echo "Done!"
+    fi
+
+    if [ "${score_overlap}" == "false" ]; then
+        stripped_ref_dir=${data_dir}/${exp}/ref_rttm_no_overlap
+        mkdir -p ${stripped_ref_dir}
+
+        echo "================================================================================"
+        echo "Stripping overlap from reference RTTMs -> ${stripped_ref_dir}"
+        echo "================================================================================"
+        for rttm_path in ${ref_dir}/*.rttm; do
+            file_name=$(basename ${rttm_path} .rttm)
+            python3 wespeaker/diar/strip_overlap.py \
+                --rttm ${rttm_path} \
+                --output ${stripped_ref_dir}/${file_name}.rttm
+        done
+
+        echo "================================================================================"
+        echo "Compute DER results (overlap regions treated as silence in reference)"
+        echo "================================================================================"
+        perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
+             -c 0.25 \
+             -r <(cat ${stripped_ref_dir}/*.rttm) \
+             -s ${data_dir}/${exp}/${sad_type}_sad_rttm 2>&1 \
+             | tee ${data_dir}/${exp}/${sad_type}_sad_res_no_overlap
+
+        if [ ${get_each_file_res} -eq 1 ]; then
+            single_file_res_no_overlap_dir=${data_dir}/${exp}/${sad_type}_single_file_res_no_overlap
+            mkdir -p ${single_file_res_no_overlap_dir}
+            echo "Compute per-file DER results (no overlap), stored under ${single_file_res_no_overlap_dir}"
+
+            awk '{print $2}' ${data_dir}/${exp}/${sad_type}_sad_rttm | sort -u | while read file_name; do
+                perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
+                     -c 0.25 \
+                     -r <(cat ${stripped_ref_dir}/${file_name}.rttm) \
+                     -s <(grep "${file_name}" ${data_dir}/${exp}/${sad_type}_sad_rttm) \
+                     > ${single_file_res_no_overlap_dir}/${file_name}_res
+            done
+            echo "Done!"
+        fi
     fi
 fi
