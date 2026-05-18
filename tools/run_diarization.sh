@@ -24,7 +24,7 @@ stop_stage=-1
 sad_type="oracle"       # oracle/system
 assign_type="cluster"   # cluster/identify/beamform
 cluster_type="spectral" # spectral/umap
-beamform_mode="supervised"  # supervised/unsupervised
+beamform_mode="supervised"  # supervised (known speaker angles)/unsupervised (agglomerative clustering)
 beamform_n_workers=4
 
 emb_window=1.5
@@ -40,6 +40,32 @@ exp_label=""
 assign_threshold=""  # min cosine similarity for speaker assignment; omit low-confidence subsegments
 score_overlap=true  # if false, strip overlap regions from ref before scoring (hyp speech in overlap = false alarm)
 map_spk_ids=false   # map cluster labels to speaker IDs after RTTM writing
+
+help_message="Usage: $0 [options]
+
+Options:
+  --data-dir DIR          Data directory (required)
+  --exp-label STR         Experiment label for output subdirectory (constructed from params if not given here)
+  --stage INT             Start from this stage (default: -1)
+  --stop-stage INT        Stop after this stage (default: -1)
+  --sad-type STR          SAD source: oracle or system (default: oracle)
+  --assign-type STR       Speaker assignment: cluster, identify, or beamform (default: cluster)
+  --cluster-type STR      Clustering algorithm: spectral or umap (default: spectral)
+  --beamform-mode STR     Beamforming mode: supervised or unsupervised (default: supervised)
+  --beamform-n-workers INT  Number of parallel workers for beamforming (default: 4)
+  --emb-window FLOAT      Embedding extraction window in seconds (default: 1.5)
+  --emb-stride FLOAT      Embedding extraction stride in seconds (default: 0.75)
+  --subseg-cmn BOOL       Apply CMN per sub-segment (causal) vs per VAD segment (default: true)
+  --utt2num-spks FILE     Oracle number of speakers per file for spectral clustering
+  --get-each-file-res INT Compute per-file DER results (default: 1)
+  --pretrained-model PATH Path to speaker embedding model (default: pretrained_models/voxceleb_resnet34_LM.onnx)
+  --enrol-scp FILE        Enrolment scp for identify mode
+  --assign-threshold FLOAT  Post-clustering confidence filter: minimum cosine similarity
+                            between a subsegment embedding and its assigned cluster centroid.
+                            Subsegments below this are omitted from output.
+  --score-overlap BOOL    If false, strip overlap from ref before scoring (default: true)
+  --map-spk-ids BOOL      Map cluster labels to speaker IDs after RTTM writing (default: false)
+"
 
 . tools/parse_options.sh
 

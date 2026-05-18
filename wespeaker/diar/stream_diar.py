@@ -29,18 +29,19 @@ import time
 import kaldiio
 import numpy as np
 import silero_vad
-import sounddevice as sd
 import torch
-import torchaudio
-import torchaudio.compliance.kaldi as kaldi
 
-from wespeaker.cli.speaker import load_model_pt
-from wespeaker.diar.extract_emb import init_session
+# Optional: only needed for --audio-device/--list-devices.
+# OSError covers Linux where the package is installed but libportaudio is not.
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
+
 from wespeaker.diar.identify import identify
 from wespeaker.diar.make_rttm import merge_segments
-
-
-SAMPLE_RATE = 16000
+from wespeaker.utils.audio import SAMPLE_RATE, compute_fbank, load_audio
+from wespeaker.utils.embedding import EmbeddingModel
 
 
 class AudioRingBuffer:
@@ -91,62 +92,6 @@ class AudioRingBuffer:
     def total_samples(self):
         """Total number of samples written since creation."""
         return self.write_pos
-
-
-class RawDefaultsFormatter(
-    argparse.ArgumentDefaultsHelpFormatter,
-    argparse.RawDescriptionHelpFormatter):
-    pass
-
-
-class EmbeddingModel:
-    """Unified interface for ONNX and PyTorch speaker embedding models.
-
-    Supports both ONNX Runtime and PyTorch backends, with automatic
-    detection based on the model source path.
-
-    Args:
-      source: Path to .onnx file or PyTorch model directory.
-      device: Inference device, 'cpu' or 'cuda'.
-      backend: 'onnx', 'pytorch', or None for auto-detection.
-    """
-
-    def __init__(self, source, device="cuda", backend=None):
-        if backend is None:
-            backend = "onnx" if source.endswith(".onnx") else "pytorch"
-        self.backend = backend
-        self.device = device
-
-        if backend == "onnx":
-            self.session = init_session(source, device)
-        elif backend == "pytorch":
-            self.model = load_model_pt(source)
-            self.model.to(torch.device(device))
-        else:
-            raise ValueError("Unknown backend: %s" % backend)
-
-    def extract(self, fbank):
-        """Extract a single embedding from fbank features.
-
-        Args:
-          fbank: np.ndarray of shape (T, 80), already CMN'd if desired.
-
-        Returns:
-          np.ndarray of shape (emb_dim,).
-        """
-        if self.backend == "onnx":
-            feats = fbank[np.newaxis, :, :].astype(np.float32)
-            emb = self.session.run(
-                input_feed={"feats": feats},
-                output_names=["embs"])[0].squeeze()
-            return emb
-        else:
-            feats = torch.from_numpy(fbank).unsqueeze(0).float().to(
-                torch.device(self.device))
-            with torch.no_grad():
-                outputs = self.model(feats)
-                emb = outputs[-1] if isinstance(outputs, tuple) else outputs
-            return emb.squeeze().cpu().numpy()
 
 
 class OnlineClusterer:
@@ -220,11 +165,13 @@ class SpeakerIdentifier:
       enrol_scp: Path to enrollment embedding scp file.
       metadata_dir: Optional directory with per-meeting metadata.json
         files to filter the gallery to meeting-specific speakers.
+      speakers: Optional list of speaker IDs to use from enrol_scp.
     """
 
-    def __init__(self, enrol_scp, metadata_dir=None):
+    def __init__(self, enrol_scp, metadata_dir=None, speakers=None):
         self.enrol_dict = kaldiio.load_scp(enrol_scp)
         self.metadata_dir = metadata_dir
+        self.speakers = speakers
         self.gallery_embeddings = None
         self.speaker_ids = None
 
@@ -234,9 +181,10 @@ class SpeakerIdentifier:
         Args:
           utt_id: Utterance ID used to locate per-meeting metadata.
         """
-        if self.metadata_dir is not None and utt_id is not None:
-            metadata_path = os.path.join(self.metadata_dir, utt_id,
-                                         "metadata.json")
+        if self.speakers is not None:
+            self.speaker_ids = self.speakers
+        elif self.metadata_dir is not None and utt_id is not None:
+            metadata_path = os.path.join(self.metadata_dir, utt_id, "metadata.json")
             with open(metadata_path) as f:
                 metadata = json.load(f)
             self.speaker_ids = [spk["id"] for spk in metadata["speakers"]]
@@ -262,44 +210,6 @@ class SpeakerIdentifier:
             self.speaker_ids)
         return labels[0], float(scores[0])
 
-
-def compute_fbank_for_chunk(audio_chunk):
-    """Compute 80-dim fbank features for an audio chunk.
-
-    Args:
-      audio_chunk: np.ndarray of shape (n_samples,), float32, 16kHz.
-
-    Returns:
-      np.ndarray of shape (T, 80), float32. No CMN applied.
-    """
-    wav = torch.from_numpy(audio_chunk).unsqueeze(0).float() * (1 << 15)
-    feat = kaldi.fbank(
-        wav,
-        num_mel_bins=80,
-        frame_length=25,
-        frame_shift=10,
-        dither=0.0,
-        sample_frequency=SAMPLE_RATE,
-        window_type="hamming",
-        use_energy=False)
-    return feat.numpy()
-
-
-def load_audio(wav_path):
-    """Load audio file as mono 16kHz float32 numpy array.
-
-    Args:
-      wav_path: Path to audio file.
-
-    Returns:
-      np.ndarray of shape (n_samples,), float32.
-    """
-    signal, sr = torchaudio.load(wav_path)
-    if sr != SAMPLE_RATE:
-        signal = torchaudio.functional.resample(signal, sr, SAMPLE_RATE)
-    if signal.shape[0] > 1:
-        signal = signal.mean(dim=0, keepdim=True)
-    return signal.squeeze(0).numpy()
 
 
 def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
@@ -330,12 +240,12 @@ def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
             threshold=args.vad_threshold)
         if not timestamps:
             if not args.quiet:
-                print("%8.3f %8.3f  --" % (start_sec, end_sec))
+                print("{:8.3f} {:8.3f}  --".format(start_sec, end_sec))
                 sys.stdout.flush()
             return None
 
     # Compute fbank features and apply per-window CMN
-    fbank = compute_fbank_for_chunk(chunk)
+    fbank = compute_fbank(chunk)
     if args.subseg_cmn:
         fbank = fbank - fbank.mean(axis=0)
 
@@ -349,16 +259,15 @@ def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
     label, confidence = assigner.assign(embedding)
 
     # Apply assignment threshold
-    if (args.assign_threshold is not None
-            and confidence < args.assign_threshold):
+    if (args.assign_threshold is not None and confidence < args.assign_threshold):
         if not args.quiet:
-            print("%8.3f %8.3f  --" % (start_sec, end_sec))
+            print("{:8.3f} {:8.3f}  unknown".format(start_sec, end_sec))
             sys.stdout.flush()
         return None
 
     if not args.quiet:
-        print("%8.3f %8.3f  %s  %.2f"
-              % (start_sec, end_sec, label, confidence))
+        print("{:8.3f} {:8.3f}  {}  {:.2f}".format(
+            start_sec, end_sec, label, confidence))
         sys.stdout.flush()
     return (start_sec, end_sec, label, confidence)
 
@@ -456,7 +365,7 @@ def process_device_stream(utt_id, emb_model, assigner, vad_model, args):
     try:
         stream.start()
         if not args.quiet:
-            print("--- %s (device %d) ---" % (utt_id, args.audio_device))
+            print("--- {} (device {}) ---".format(utt_id, args.audio_device))
             print("Listening... press Ctrl+C to stop.")
             sys.stdout.flush()
 
@@ -495,6 +404,12 @@ def process_device_stream(utt_id, emb_model, assigner, vad_model, args):
     return results
 
 
+class RawDefaultsFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter):
+    pass
+
+
 def get_args():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -503,10 +418,8 @@ def get_args():
     # Input
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--wav", help="single wav file path")
-    input_group.add_argument("--wav-scp",
-                             help="wav.scp for sequential processing")
-    input_group.add_argument("--audio-device", type=int, default=None,
-                             metavar="DEVICE_ID",
+    input_group.add_argument("--wav-scp", help="wav.scp for sequential processing")
+    input_group.add_argument("--audio-device", type=int, default=None, metavar="DEVICE_ID",
                              help="audio input device index for live capture")
     parser.add_argument("--list-devices", action="store_true",
                         help="list available audio devices and exit")
@@ -516,16 +429,13 @@ def get_args():
     # Model
     parser.add_argument("--model", default=None,
                         help="path to .onnx file or PyTorch model directory")
-    parser.add_argument("--backend", default=None,
-                        choices=["onnx", "pytorch"],
+    parser.add_argument("--backend", default=None, choices=["onnx", "pytorch"],
                         help="model backend (auto-detected from --model)")
-    parser.add_argument("--device", default="cuda",
-                        choices=["cpu", "cuda"],
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"],
                         help="inference device")
 
     # Speaker assignment
-    parser.add_argument("--assign", default="cluster",
-                        choices=["cluster", "identify"],
+    parser.add_argument("--assign", default="cluster", choices=["cluster", "identify"],
                         help="speaker assignment strategy")
     parser.add_argument("--cluster-threshold", type=float, default=0.5,
                         help="min cosine similarity to assign to existing "
@@ -535,11 +445,12 @@ def get_args():
     parser.add_argument("--assign-threshold", type=float, default=None,
                         help="min confidence to emit a speaker label")
     parser.add_argument("--enrol-scp", default=None,
-                        help="enrollment embedding scp "
-                             "(required for --assign identify)")
+                        help="enrollment embedding scp (required for identification mode)")
     parser.add_argument("--metadata-dir", default=None,
                         help="per-meeting metadata directory for filtering "
                              "enrolled speakers")
+    parser.add_argument("--speakers", nargs="+", default=None,
+                        help="speaker IDs to use from enrol-scp (identification mode only)")
 
     # Windowing
     parser.add_argument("--window-secs", type=float, default=1.5,
@@ -553,8 +464,8 @@ def get_args():
                         help="wait for full window before first inference")
 
     # VAD
-    parser.add_argument("--no-vad", dest="vad", action="store_false",
-                        default=True, help="disable streaming Silero VAD")
+    parser.add_argument("--no-vad", dest="vad", action="store_false", default=True,
+                        help="disable streaming Silero VAD")
     parser.add_argument("--vad-threshold", type=float, default=0.5,
                         help="speech probability threshold for VAD")
 
@@ -568,21 +479,22 @@ def get_args():
 
     # Pacing
     parser.add_argument("--real-time", action="store_true",
-                        help="sleep between chunks to simulate real-time "
-                             "pacing")
+                        help="sleep between chunks to simulate real-time pacing")
 
     args = parser.parse_args()
+
+    if (args.list_devices or args.audio_device is not None) and sd is None:
+        parser.error(
+            "sounddevice is required for device input -- "
+            "pip install sounddevice")
 
     if args.list_devices:
         return args
 
     if args.wav is None and args.wav_scp is None and args.audio_device is None:
-        parser.error(
-            "one of --wav, --wav-scp, or --audio-device is required")
+        parser.error("one of --wav, --wav-scp, or --audio-device is required")
     if args.model is None:
         parser.error("--model is required")
-    if args.output is None:
-        parser.error("--output is required")
     if args.assign == "identify" and args.enrol_scp is None:
         parser.error("--enrol-scp is required when --assign identify")
 
@@ -601,7 +513,7 @@ def main():
     if args.assign == "cluster":
         assigner = OnlineClusterer(args.cluster_threshold, args.max_speakers)
     else:
-        assigner = SpeakerIdentifier(args.enrol_scp, args.metadata_dir)
+        assigner = SpeakerIdentifier(args.enrol_scp, args.metadata_dir, args.speakers)
 
     vad_model = None
     if args.vad:
@@ -633,7 +545,7 @@ def main():
                     file_list.append((parts[0], parts[1]))
 
         for utt_id, wav_path in file_list:
-            print("--- %s ---" % utt_id)
+            print("--- {} ---".format(utt_id))
 
             audio = load_audio(wav_path)
 
@@ -647,14 +559,15 @@ def main():
             all_results[utt_id] = results
 
     # Write labels file
-    output_dir = os.path.dirname(args.output)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(args.output, "w") as f:
-        for utt_id, results in all_results.items():
-            for start, end, label, conf in results:
-                f.write("%s %.3f %.3f %s %.4f\n"
-                        % (utt_id, start, end, label, conf))
+    if args.output is not None:
+        output_dir = os.path.dirname(args.output)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(args.output, "w") as f:
+            for utt_id, results in all_results.items():
+                for start, end, label, conf in results:
+                    f.write("{} {:.3f} {:.3f} {} {:.4f}\n".format(
+                        utt_id, start, end, label, conf))
 
     # Write RTTM if requested
     if args.output_rttm is not None:
@@ -671,8 +584,8 @@ def main():
         merged = merge_segments(utt_to_subseg_labels)
         with open(args.output_rttm, "w") as f:
             for utt, begin, end, label in merged:
-                f.write("SPEAKER %s 1 %.3f %.3f <NA> <NA> %s <NA> <NA>\n"
-                        % (utt, begin, end - begin, label))
+                f.write("SPEAKER {} 1 {:.3f} {:.3f} <NA> <NA> {} <NA> <NA>\n".format(
+                    utt, begin, end - begin, label))
 
 
 if __name__ == "__main__":

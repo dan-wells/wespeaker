@@ -290,6 +290,8 @@ if __name__ == '__main__':
                     subsegs_list, embeddings_list,
                     executor.map(run_cluster, embeddings_list)):
                 if args.threshold is not None:
+                    # Post-clustering filter: drop subsegments with low
+                    # similarity to their assigned centroid.
                     scores = compute_assignment_scores(embeddings, labels)
                 for i, (subseg, label) in enumerate(zip(subsegs, labels)):
                     if args.threshold is not None and scores[i] < args.threshold:

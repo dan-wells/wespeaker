@@ -36,7 +36,6 @@ setup(
         "PyYAML",
         "matplotlib",
         "onnxruntime",
-        "sounddevice",
         "soundfile",
         "scikit-learn",
         "tableprint",
@@ -57,6 +56,9 @@ setup(
         "dev": [
             "flake8",
             "pre-commit",
+        ],
+        "streaming_diarization": [
+            "sounddevice",
         ],
         "meeting_sim": [
             "pyroomacoustics",

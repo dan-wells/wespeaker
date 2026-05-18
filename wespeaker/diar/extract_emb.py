@@ -21,27 +21,8 @@ from collections import OrderedDict
 import numpy as np
 from tqdm import tqdm
 
-import onnxruntime as ort
+from wespeaker.utils.embedding import init_session
 from wespeaker.utils.utils import validate_path
-
-
-def init_session(source, device):
-    # Initialize ONNX session
-    if device == "cpu":
-        providers = ["CPUExecutionProvider"]
-    elif device == "cuda":
-        providers = ["CUDAExecutionProvider"]
-    else:
-        raise ValueError
-
-    opts = ort.SessionOptions()
-    opts.inter_op_num_threads = 1
-    opts.intra_op_num_threads = 1
-    opts.log_severity_level = 1
-    session = ort.InferenceSession(source,
-                                   sess_options=opts,
-                                   providers=providers)
-    return session
 
 
 def read_fbank(scp_file):
