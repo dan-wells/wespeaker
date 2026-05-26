@@ -192,18 +192,14 @@ def plot_diarization(hyp_rttm, ref_rttm=None, wav_path=None,
     # Determine speaker order: use reference speakers as base, add any
     # unmapped hyp speakers at the end
     if ref_segments is not None:
-        ref_speakers = sorted(set(seg[2] for seg in ref_segments))
-        hyp_speaker_labels = set(seg[2] for seg in hyp_segments)
-        mapped_labels = set()
-        if mapping:
-            mapped_labels = set(mapping.values())
+        ref_speakers = list(dict.fromkeys(seg[2] for seg in ref_segments))
         # Extra speakers from hyp that didn't map to any ref speaker
-        extra_speakers = sorted(
-            spk for spk in hyp_speaker_labels
-            if mapping and mapping.get(spk, spk) not in set(ref_speakers))
+        extra_speakers = [
+            spk for spk in dict.fromkeys(seg[2] for seg in hyp_segments)
+            if mapping and mapping.get(spk, spk) not in set(ref_speakers)]
         all_speakers = ref_speakers + extra_speakers
     else:
-        all_speakers = sorted(set(seg[2] for seg in hyp_segments))
+        all_speakers = list(dict.fromkeys(seg[2] for seg in hyp_segments))
 
     # Build speaker -> track index
     spk_to_track = {spk: i for i, spk in enumerate(all_speakers)}
