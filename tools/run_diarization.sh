@@ -21,7 +21,7 @@ set -euo pipefail
 
 stage=-1
 stop_stage=-1
-sad_type="oracle"       # oracle/system
+sad_type="oracle"       # oracle/system/mvad
 assign_type="cluster"   # cluster/identify/beamform
 cluster_type="spectral" # spectral/umap
 beamform_mode="supervised"  # supervised (known speaker angles)/unsupervised (agglomerative clustering)
@@ -34,6 +34,7 @@ utt2num_spks=""  # oracle number of speakers per file for spectral clustering
 get_each_file_res=1
 
 pretrained_model=pretrained_models/voxceleb_resnet34_LM.onnx
+mvad_model=""  # path to MVAD_V2 checkpoint (required when sad_type=mvad)
 enrol_scp=""
 data_dir=""
 exp_label=""
@@ -48,7 +49,7 @@ Options:
   --exp-label STR         Experiment label for output subdirectory (constructed from params if not given here)
   --stage INT             Start from this stage (default: -1)
   --stop-stage INT        Stop after this stage (default: -1)
-  --sad-type STR          SAD source: oracle or system (default: oracle)
+  --sad-type STR          SAD source: oracle, system, or mvad (default: oracle)
   --assign-type STR       Speaker assignment: cluster, identify, or beamform (default: cluster)
   --cluster-type STR      Clustering algorithm: spectral or umap (default: spectral)
   --beamform-mode STR     Beamforming mode: supervised or unsupervised (default: supervised)
@@ -59,6 +60,7 @@ Options:
   --utt2num-spks FILE     Oracle number of speakers per file for spectral clustering
   --get-each-file-res INT Compute per-file DER results (default: 1)
   --pretrained-model PATH Path to speaker embedding model (default: pretrained_models/voxceleb_resnet34_LM.onnx)
+  --mvad-model PATH       Path to MVAD_V2 checkpoint (required when --sad-type mvad)
   --enrol-scp FILE        Enrolment scp for identify mode
   --assign-threshold FLOAT  Post-clustering confidence filter: minimum cosine similarity
                             between a subsegment embedding and its assigned cluster centroid.
@@ -146,6 +148,18 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
        python3 wespeaker/diar/make_system_sad.py \
                --scp ${data_dir}/wav.scp \
                --min-duration $min_duration > ${data_dir}/${exp}/system_sad
+    fi
+
+    if [[ "x${sad_type}" == "xmvad" ]]; then
+       # MVAD SAD: multi-class VAD keeping only single-speaker regions
+       if [ -z "$mvad_model" ]; then
+           echo "Error: --mvad-model is required when --sad-type mvad"
+           exit 1
+       fi
+       python3 wespeaker/diar/make_mvad_sad.py \
+               --scp ${data_dir}/wav.scp \
+               --model ${mvad_model} \
+               --min-duration $min_duration > ${data_dir}/${exp}/mvad_sad
     fi
 fi
 
@@ -284,25 +298,21 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
     fi
 
     if [ "${score_overlap}" == "false" ]; then
-        stripped_ref_dir=${data_dir}/${exp}/ref_rttm_no_overlap
-        mkdir -p ${stripped_ref_dir}
+        stripped_ref=${data_dir}/${exp}/ref_rttm_no_overlap.rttm
 
         echo "================================================================================"
-        echo "Stripping overlap from reference RTTMs -> ${stripped_ref_dir}"
+        echo "Stripping overlap from reference RTTMs -> ${stripped_ref}"
         echo "================================================================================"
-        for rttm_path in ${ref_dir}/*.rttm; do
-            file_name=$(basename ${rttm_path} .rttm)
-            python3 wespeaker/diar/strip_overlap.py \
-                --rttm ${rttm_path} \
-                --output ${stripped_ref_dir}/${file_name}.rttm
-        done
+        python3 wespeaker/diar/strip_overlap.py \
+            --rttm <(cat ${ref_dir}/*.rttm) \
+            --output ${stripped_ref}
 
         echo "================================================================================"
         echo "Compute DER results (overlap regions treated as silence in reference)"
         echo "================================================================================"
         perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
              -c 0.25 \
-             -r <(cat ${stripped_ref_dir}/*.rttm) \
+             -r ${stripped_ref} \
              -s ${data_dir}/${exp}/${sad_type}_sad_rttm 2>&1 \
              | tee ${data_dir}/${exp}/${sad_type}_sad_res_no_overlap
 
@@ -314,7 +324,7 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
             awk '{print $2}' ${data_dir}/${exp}/${sad_type}_sad_rttm | sort -u | while read file_name; do
                 perl external_tools/SCTK-2.4.12/src/md-eval/md-eval.pl \
                      -c 0.25 \
-                     -r <(cat ${stripped_ref_dir}/${file_name}.rttm) \
+                     -r <(grep "${file_name}" ${stripped_ref}) \
                      -s <(grep "${file_name}" ${data_dir}/${exp}/${sad_type}_sad_rttm) \
                      > ${single_file_res_no_overlap_dir}/${file_name}_res
             done

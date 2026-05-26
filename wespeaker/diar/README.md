@@ -6,7 +6,7 @@
 
 A window of `--window-secs` (default 1.5s) slides forward by `--stride-secs` (default 0.5s). Each window is passed through:
 
-1. VAD gating (Silero VAD, optional)
+1. VAD gating (Silero VAD or MVAD_V2, optional)
 2. Fbank feature extraction (80-dim, Kaldi-compatible)
 3. Per-window cepstral mean normalisation
 4. Speaker embedding extraction (ONNX or PyTorch model)
@@ -20,6 +20,7 @@ This contrasts with the offline diarization pipeline (through `spectral_clustere
 - **Speaker embedding model**: either an ONNX file (`.onnx`) or a PyTorch model directory (containing `config.yaml` + checkpoint).
 - **For identification mode**: an `enrol.scp` file mapping speaker IDs to pre-computed mean embeddings. See [Producing Enrolment Data](#producing-enrolment-data) below.
 - **Silero VAD**: installed as a dependency (`silero-vad` package). Used by default; disable with `--no-vad`.
+- **MVAD_V2** (optional): a multi-class VAD model that classifies frames as silence, single-speaker, or overlap. Select with `--vad-mode mvad --mvad-model /path/to/checkpoint.pt`. Overlap and silence frames are gated out, so only windows with sufficient single-speaker content are passed to the embedding model.
 - **For live device input**: the `sounddevice` package. On Linux this also requires the system `libportaudio2` library; macOS and Windows wheels bundle it. Not needed for file-based processing.
 
 
@@ -163,7 +164,10 @@ Key parameters:
 | `--stride-secs` | 0.5 | Stride between windows (controls time resolution) |
 | `--no-subseg-cmn` | off | Disable per-window cepstral mean normalisation |
 | `--wait-full-buffer` | off | Skip inference until a full window is available |
+| `--vad-mode` | silero | VAD backend: `silero` (binary) or `mvad` (multi-class with overlap detection) |
 | `--vad-threshold` | 0.5 | Silero VAD speech probability threshold |
+| `--mvad-model` | None | Path to MVAD_V2 checkpoint (required when `--vad-mode mvad`) |
+| `--mvad-overlap-threshold` | 0.5 | Min fraction of single-speaker frames to process a window (MVAD mode) |
 | `--no-vad` | off | Disable VAD entirely |
 | `--assign-threshold` | None | Discard windows with confidence below this |
 | `--real-time` | off | Pace file processing to simulate real-time input |
@@ -205,3 +209,34 @@ merged into contiguous segments:
 SPEAKER meeting001 1 0.000 2.000 <NA> <NA> speaker_a <NA> <NA>
 SPEAKER meeting001 1 1.000 1.500 <NA> <NA> speaker_b <NA> <NA>
 ```
+
+
+## Embedding Extraction Strategies
+
+The three pipelines that produce speaker embeddings use different approaches to VAD and windowing:
+
+### Offline (`make_system_sad.py` / `make_mvad_sad.py` -> `make_fbank.py` -> `extract_emb.py`)
+
+VAD runs first as a pre-segmentation step, producing a segments file that lists only speech regions.
+Feature extraction and embedding extraction only ever see speech -- silence is discarded entirely.
+Within each speech segment, a sliding window (default 1.5s window, 0.75s stride) produces fixed-length subsegments for the embedding model.
+Short or tail subsegments are padded to the full window length via `np.resize` (cyclic repetition of initial frames).
+
+Two system SAD options are available: `make_system_sad.py` (Silero VAD, binary speech/silence) and `make_mvad_sad.py` (MVAD_V2, retains only single-speaker regions -- both silence and overlap are excluded).
+Select via `--sad-type system` or `--sad-type mvad` in `tools/run_diarization.sh`.
+
+### Streaming (`stream_diar.py`)
+
+A fixed-stride sliding window (default 1.5s window, 0.5s stride) advances continuously over the full audio.
+VAD acts as a per-window gate: if the selected VAD detects insufficient speech in the current window, that window is skipped entirely.
+With Silero VAD (`--vad-mode silero`, the default), the gate is binary -- any detected speech passes the window through.
+With MVAD_V2 (`--vad-mode mvad`), the gate is multi-class -- windows are skipped unless at least `--mvad-overlap-threshold` fraction of frames are classified as single-speaker, filtering out both silence and overlap.
+If a window passes the gate, the **entire window** -- including any silence within it -- is passed through feature extraction and embedding.
+This is coarser than the offline approach: silence interspersed with speech within a single window still reaches the embedding model.
+Short chunks (at the start of a stream or end of a file) are padded with `np.resize`, matching the offline behaviour.
+
+### Enrolment (`tools/enroll_speakers.py`)
+
+No VAD and no windowing.
+Each enrollment utterance is assumed to be a clean speech recording, and a single embedding is extracted from the full utterance.
+Per-speaker mean embeddings are computed by averaging across all enrollment utterances for that speaker, then L2-normalising.

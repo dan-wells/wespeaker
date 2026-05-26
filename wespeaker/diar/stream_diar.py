@@ -40,6 +40,7 @@ except (ImportError, OSError):
 
 from wespeaker.diar.identify import identify
 from wespeaker.diar.make_rttm import merge_segments
+from wespeaker.diar.mvad import load_mvad_model, mvad_check_overlap
 from wespeaker.utils.audio import SAMPLE_RATE, compute_fbank, load_audio
 from wespeaker.utils.embedding import EmbeddingModel
 
@@ -222,7 +223,7 @@ def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
       end_sec: End time of this chunk in seconds.
       emb_model: EmbeddingModel instance.
       assigner: OnlineClusterer or SpeakerIdentifier instance.
-      vad_model: Silero VAD model, or None if VAD is disabled.
+      vad_model: Silero VAD model, MVAD state tuple, or None.
       args: Parsed CLI arguments.
       window_frames: Expected number of fbank frames for a full window.
 
@@ -231,7 +232,17 @@ def process_chunk(chunk, start_sec, end_sec, emb_model, assigner,
         detected and above threshold, else None.
     """
     # VAD gate
-    if vad_model is not None:
+    if vad_model is not None and args.vad_mode == "mvad":
+        mvad_model, feat_mean, feat_std, mvad_device = vad_model
+        skip = mvad_check_overlap(
+            chunk, SAMPLE_RATE, mvad_model, feat_mean, feat_std,
+            mvad_device, threshold=args.mvad_overlap_threshold)
+        if skip:
+            if not args.quiet:
+                print("{:8.3f} {:8.3f}  --".format(start_sec, end_sec))
+                sys.stdout.flush()
+            return None
+    elif vad_model is not None:
         vad_model.reset_states()
         chunk_tensor = torch.from_numpy(chunk).float()
         timestamps = silero_vad.get_speech_timestamps(
@@ -284,7 +295,7 @@ def process_file(audio, utt_id, emb_model, assigner, vad_model, args):
       utt_id: Utterance identifier string.
       emb_model: EmbeddingModel instance.
       assigner: OnlineClusterer or SpeakerIdentifier instance.
-      vad_model: Silero VAD model, or None if VAD is disabled.
+      vad_model: Silero VAD model, MVAD state tuple, or None.
       args: Parsed CLI arguments.
 
     Returns:
@@ -342,7 +353,7 @@ def process_device_stream(utt_id, emb_model, assigner, vad_model, args):
       utt_id: Utterance identifier string.
       emb_model: EmbeddingModel instance.
       assigner: OnlineClusterer or SpeakerIdentifier instance.
-      vad_model: Silero VAD model, or None if VAD is disabled.
+      vad_model: Silero VAD model, MVAD state tuple, or None.
       args: Parsed CLI arguments.
 
     Returns:
@@ -464,10 +475,20 @@ def get_args():
                         help="wait for full window before first inference")
 
     # VAD
+    parser.add_argument("--vad-mode", default="silero",
+                        choices=["silero", "mvad"],
+                        help="VAD backend: silero (binary speech/silence) "
+                             "or mvad (multi-class with overlap detection)")
     parser.add_argument("--no-vad", dest="vad", action="store_false", default=True,
-                        help="disable streaming Silero VAD")
+                        help="disable VAD entirely")
     parser.add_argument("--vad-threshold", type=float, default=0.5,
-                        help="speech probability threshold for VAD")
+                        help="speech probability threshold for Silero VAD")
+    parser.add_argument("--mvad-model", default=None,
+                        help="path to MVAD_V2 checkpoint "
+                             "(required when --vad-mode mvad)")
+    parser.add_argument("--mvad-overlap-threshold", type=float, default=0.5,
+                        help="min fraction of single-speaker frames to "
+                             "process a window (MVAD mode)")
 
     # Output
     parser.add_argument("--output", default=None,
@@ -497,6 +518,8 @@ def get_args():
         parser.error("--model is required")
     if args.assign == "identify" and args.enrol_scp is None:
         parser.error("--enrol-scp is required when --assign identify")
+    if args.vad and args.vad_mode == "mvad" and args.mvad_model is None:
+        parser.error("--mvad-model is required when --vad-mode mvad")
 
     return args
 
@@ -517,7 +540,10 @@ def main():
 
     vad_model = None
     if args.vad:
-        vad_model = silero_vad.load_silero_vad()
+        if args.vad_mode == "mvad":
+            vad_model = load_mvad_model(args.mvad_model, args.device)
+        else:
+            vad_model = silero_vad.load_silero_vad()
 
     all_results = {}
 
