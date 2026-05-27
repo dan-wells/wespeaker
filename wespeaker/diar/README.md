@@ -38,7 +38,7 @@ python -m wespeaker.diar.stream_diar \
 
 ## Input Modes
 
-### Live device input (`--audio-device`)
+### Live device input (`--audio-in`)
 
 Stream from a sound input device in real time. Use `--list-devices` to find the device ID.
 
@@ -49,7 +49,7 @@ python -m wespeaker.diar.stream_diar --list-devices
 # Stream from device 0
 python -m wespeaker.diar.stream_diar \
     --model model.onnx \
-    --audio-device 0 \
+    --audio-in 0 \
     --assign cluster
 ```
 
@@ -171,6 +171,8 @@ Key parameters:
 | `--no-vad` | off | Disable VAD entirely |
 | `--assign-threshold` | None | Discard windows with confidence below this |
 | `--real-time` | off | Pace file processing to simulate real-time input |
+| `--playback` | off | Play audio through speakers during file-based streaming (implies `--real-time`) |
+| `--audio-out` | None | Output audio device index for `--playback` (default: system default) |
 | `--quiet` | off | Suppress per-window stdout output |
 
 **Tuning guidance**:

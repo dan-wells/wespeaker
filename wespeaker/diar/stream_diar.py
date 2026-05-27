@@ -31,7 +31,7 @@ import numpy as np
 import silero_vad
 import torch
 
-# Optional: only needed for --audio-device/--list-devices.
+# Optional: only needed for --audio-in/--audio-out/--list-devices.
 # OSError covers Linux where the package is installed but libportaudio is not.
 try:
     import sounddevice as sd
@@ -307,37 +307,60 @@ def process_file(audio, utt_id, emb_model, assigner, vad_model, args):
     stride_samples = int(args.stride_secs * SAMPLE_RATE)
     window_frames = int(args.window_secs * 1000) // 10
 
+    playback_stream = None
+    if args.playback:
+        playback_stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            latency="high",
+            device=args.audio_out)
+        playback_stream.start()
+
     results = []
     pos = 0
-    while pos < num_samples:
-        t0 = time.monotonic()
+    try:
+        while pos < num_samples:
+            t0 = time.monotonic()
 
-        window_end = min(pos + stride_samples, num_samples)
-        window_start = max(0, window_end - window_samples)
-        chunk = audio[window_start:window_end]
+            window_end = min(pos + stride_samples, num_samples)
+            window_start = max(0, window_end - window_samples)
+            chunk = audio[window_start:window_end]
 
-        start_sec = window_start / SAMPLE_RATE
-        end_sec = window_end / SAMPLE_RATE
+            start_sec = window_start / SAMPLE_RATE
+            end_sec = window_end / SAMPLE_RATE
 
-        # Skip if chunk is shorter than one stride
-        if len(chunk) < stride_samples:
-            break
+            if playback_stream is not None:
+                # TODO(danwells): some clicks introduced in playback, maybe from
+                # interleaved processing/some delay between each chunk
+                playback_stream.write(audio[pos:window_end].reshape(-1, 1))
 
-        # Skip if waiting for full buffer and chunk is short
-        if args.wait_full_buffer and len(chunk) < window_samples:
+            # Skip if chunk is shorter than one stride
+            if len(chunk) < stride_samples:
+                break
+
+            # Skip if waiting for full buffer and chunk is short
+            if args.wait_full_buffer and len(chunk) < window_samples:
+                pos += stride_samples
+                continue
+
+            result = process_chunk(
+                chunk, start_sec, end_sec,
+                emb_model, assigner, vad_model, args, window_frames)
+            if result is not None:
+                results.append(result)
+
             pos += stride_samples
-            continue
 
-        result = process_chunk(
-            chunk, start_sec, end_sec,
-            emb_model, assigner, vad_model, args, window_frames)
-        if result is not None:
-            results.append(result)
-
-        pos += stride_samples
-        if args.real_time:
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0, args.stride_secs - elapsed))
+            # Use output audio stream as clock if in playback mode, otherwise
+            # sleep here to simulate real-time output labels
+            if args.real_time and playback_stream is None:
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0, args.stride_secs - elapsed))
+    finally:
+        if playback_stream is not None:
+            playback_stream.stop()
+            playback_stream.close()
 
     return results
 
@@ -371,12 +394,12 @@ def process_device_stream(utt_id, emb_model, assigner, vad_model, args):
         channels=1,
         dtype="float32",
         blocksize=stride_samples,
-        device=args.audio_device)
+        device=args.audio_in)
 
     try:
         stream.start()
         if not args.quiet:
-            print("--- {} (device {}) ---".format(utt_id, args.audio_device))
+            print("--- {} (device {}) ---".format(utt_id, args.audio_in))
             print("Listening... press Ctrl+C to stop.")
             sys.stdout.flush()
 
@@ -430,7 +453,7 @@ def get_args():
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--wav", help="single wav file path")
     input_group.add_argument("--wav-scp", help="wav.scp for sequential processing")
-    input_group.add_argument("--audio-device", type=int, default=None, metavar="DEVICE_ID",
+    input_group.add_argument("--audio-in", type=int, default=None, metavar="DEVICE_ID",
                              help="audio input device index for live capture")
     parser.add_argument("--list-devices", action="store_true",
                         help="list available audio devices and exit")
@@ -501,19 +524,28 @@ def get_args():
     # Pacing
     parser.add_argument("--real-time", action="store_true",
                         help="sleep between chunks to simulate real-time pacing")
+    parser.add_argument("--playback", action="store_true",
+                        help="play audio through speakers during file-based "
+                             "streaming (implies --real-time)")
+    parser.add_argument("--audio-out", type=int, default=None, metavar="DEVICE_ID",
+                        help="output audio device index for --playback")
 
     args = parser.parse_args()
 
-    if (args.list_devices or args.audio_device is not None) and sd is None:
+    if (args.list_devices or args.audio_in is not None
+            or args.playback or args.audio_out is not None) and sd is None:
         parser.error(
-            "sounddevice is required for device input -- "
+            "sounddevice is required for audio device I/O -- "
             "pip install sounddevice")
+
+    if args.playback:
+        args.real_time = True
 
     if args.list_devices:
         return args
 
-    if args.wav is None and args.wav_scp is None and args.audio_device is None:
-        parser.error("one of --wav, --wav-scp, or --audio-device is required")
+    if args.wav is None and args.wav_scp is None and args.audio_in is None:
+        parser.error("one of --wav, --wav-scp, or --audio-in is required")
     if args.model is None:
         parser.error("--model is required")
     if args.assign == "identify" and args.enrol_scp is None:
@@ -547,7 +579,7 @@ def main():
 
     all_results = {}
 
-    if args.audio_device is not None:
+    if args.audio_in is not None:
         utt_id = args.utt_id
 
         if args.assign == "cluster":
