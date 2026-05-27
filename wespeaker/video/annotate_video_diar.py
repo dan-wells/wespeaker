@@ -36,6 +36,8 @@ from wespeaker.diar.plot_diar import (
     _filter_segments,
     _find_overlap_regions,
 )
+from wespeaker.utils.file_utils import read_scp
+from wespeaker.video.faces_3ddfa import FaceLandmarks
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ _STRIP_THEMES = {
     'dark': {
         'bg': (30, 30, 30),
         'cursor': (255, 255, 255),
-        'label': (220, 220, 220),
+        'label': (255, 255, 255),
         'overlap': (80, 80, 80),
     },
     'light': {
@@ -55,8 +57,21 @@ _STRIP_THEMES = {
     },
 }
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
-_FONT_SCALE = 0.45
 _FONT_THICKNESS = 1
+_FONT_SCALE_REF = 0.45
+_FONT_HEIGHT_REF = 720  # set readable font height based on 720p video
+
+
+def compute_font_scale(frame_height):
+    """Compute font scale proportional to frame height.
+
+    Args:
+        frame_height: Video frame height in pixels.
+
+    Returns:
+        Font scale suitable for cv2.putText.
+    """
+    return _FONT_SCALE_REF * frame_height / _FONT_HEIGHT_REF
 
 
 def get_args():
@@ -105,8 +120,20 @@ def get_args():
     parser.add_argument('--strip-bg', default=None,
                         choices=['dark', 'light'],
                         help='Strip background colour (default: light)')
+    parser.add_argument('--faces', default=None,
+                        help='3DDFA_V2 landmark CSV file for face bounding '
+                             'boxes')
+    parser.add_argument('--faces-orig-size', default=None,
+                        help='Original video resolution as WxH (e.g. '
+                             '1920x1080) for rescaling face coordinates')
+    parser.add_argument('--face2spk', default=None,
+                        help='Face-to-speaker mapping file '
+                             '(lines: face_idx speaker_label)')
     parser.add_argument('--codec', default='mp4v',
                         help='FourCC codec for video writer')
+    parser.add_argument('--reencode', action='store_true', default=False,
+                        help='Re-encode video with libx264 during mux '
+                             '(smaller output, slower)')
     return parser.parse_args()
 
 
@@ -124,31 +151,6 @@ def hex_to_bgr(hex_colour):
     g = int(hex_colour[2:4], 16)
     b = int(hex_colour[4:6], 16)
     return (b, g, r)
-
-
-def read_spk2spk(path):
-    """Parse a speaker label mapping file.
-
-    Each line contains: original_label mapped_label
-    Fields are whitespace-separated; the mapped label is everything
-    after the first whitespace (allowing spaces in display names).
-
-    Args:
-        path: Path to the spk2spk file.
-
-    Returns:
-        Dict mapping original label to display label.
-    """
-    mapping = {}
-    with open(path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                mapping[parts[0]] = parts[1]
-    return mapping
 
 
 def extract_audio_from_video(video_path, output_audio_path):
@@ -173,7 +175,8 @@ def extract_audio_from_video(video_path, output_audio_path):
                 result.stderr.decode('utf-8', errors='replace')))
 
 
-def mux_audio_video(video_path, audio_path, output_path, audio_offset=0.0):
+def mux_audio_video(video_path, audio_path, output_path, audio_offset=0.0,
+                    reencode=False):
     """Combine a silent video with an audio file using ffmpeg.
 
     Args:
@@ -183,6 +186,7 @@ def mux_audio_video(video_path, audio_path, output_path, audio_offset=0.0):
         audio_offset: Offset in seconds. Positive: audio started before
             video, seek this far into audio. Negative: video started
             before audio, pad silence at audio start.
+        reencode: If True, re-encode video with libx264 (smaller output).
 
     Raises:
         RuntimeError: If ffmpeg returns a non-zero exit code.
@@ -194,8 +198,12 @@ def mux_audio_video(video_path, audio_path, output_path, audio_offset=0.0):
     elif audio_offset < 0.0:
         # Video starts before audio: delay audio with silence
         cmd += ['-itsoffset', str(-audio_offset)]
-    cmd += ['-i', audio_path, '-c:v', 'copy', '-c:a', 'aac',
-            '-shortest', output_path]
+    cmd += ['-i', audio_path]
+    if reencode:
+        cmd += ['-c:v', 'libx264', '-crf', '23', '-preset', 'medium']
+    else:
+        cmd += ['-c:v', 'copy']
+    cmd += ['-c:a', 'aac', '-shortest', output_path]
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(
@@ -274,7 +282,7 @@ def render_diarization_strip(timestamp, window_width, cursor_position,
                              display_names=None,
                              ref_segments=None, mapping=None,
                              ref_style='hollow', show_overlap=False,
-                             theme=None):
+                             theme=None, font_scale=None):
     """Render the diarization timeline strip for a single frame.
 
     Args:
@@ -294,12 +302,15 @@ def render_diarization_strip(timestamp, window_width, cursor_position,
         show_overlap: Whether to shade overlap regions.
         theme: Dict with keys 'bg', 'cursor', 'label', 'overlap' mapping
             to BGR tuples. Defaults to _STRIP_THEMES['dark'].
+        font_scale: Font scale for labels. If None, uses _FONT_SCALE_REF.
 
     Returns:
         numpy.ndarray of shape (strip_height, strip_width, 3) dtype uint8.
     """
     if theme is None:
         theme = _STRIP_THEMES['dark']
+    if font_scale is None:
+        font_scale = _FONT_SCALE_REF
     bg_colour = theme['bg']
     cursor_colour = theme['cursor']
     label_colour = theme['label']
@@ -387,12 +398,47 @@ def render_diarization_strip(timestamp, window_width, cursor_position,
             cv2.addWeighted(strip[:, ox1:ox2], 0.3, overlay, 0.7,
                             0, strip[:, ox1:ox2])
 
-    # Cursor line
+    return strip
+
+
+def draw_strip_overlays(target, strip_y_offset, strip_width, strip_height,
+                        cursor_position, all_speakers, spk_to_track,
+                        display_names=None, font_scale=None, theme=None):
+    """Draw cursor and speaker labels onto the composited output frame.
+
+    This is drawn after compositing so that text is never affected by
+    overlay alpha blending.
+
+    Args:
+        target: Output frame (modified in place).
+        strip_y_offset: Y pixel offset where the strip region starts.
+        strip_width: Width of the strip in pixels.
+        strip_height: Height of the strip in pixels.
+        cursor_position: Fraction (0-1) of strip width for the cursor.
+        all_speakers: Ordered list of speaker labels.
+        spk_to_track: Dict mapping speaker label to track index.
+        display_names: Optional dict mapping speaker label to display name.
+        font_scale: Font scale for labels. If None, uses _FONT_SCALE_REF.
+        theme: Dict with keys 'bg', 'cursor', 'label'. Defaults to dark.
+    """
+    if theme is None:
+        theme = _STRIP_THEMES['dark']
+    if font_scale is None:
+        font_scale = _FONT_SCALE_REF
+    bg_colour = theme['bg']
+    cursor_colour = theme['cursor']
+    label_colour = theme['label']
+
+    n_tracks = len(all_speakers)
+    if n_tracks == 0:
+        return
+    track_height = strip_height / n_tracks
+
     cursor_x = int(cursor_position * strip_width)
-    cv2.line(strip, (cursor_x, 0), (cursor_x, strip_height - 1),
+    cv2.line(target, (cursor_x, strip_y_offset),
+             (cursor_x, strip_y_offset + strip_height - 1),
              cursor_colour, 1)
 
-    # Speaker labels (right-aligned just left of cursor)
     label_margin = 8
     for spk in all_speakers:
         track = spk_to_track[spk]
@@ -400,20 +446,18 @@ def render_diarization_strip(timestamp, window_width, cursor_position,
             label = display_names.get(spk, spk)
         else:
             label = spk
-        y_centre = int((track + 0.5) * track_height)
+        y_centre = int(strip_y_offset + (track + 0.5) * track_height)
         (text_w, text_h), _ = cv2.getTextSize(
-            label, _FONT, _FONT_SCALE, _FONT_THICKNESS)
+            label, _FONT, font_scale, _FONT_THICKNESS)
         text_x = cursor_x - text_w - label_margin
         text_y = y_centre + text_h // 2
         if text_x >= 0:
-            cv2.putText(strip, label, (text_x, text_y), _FONT,
-                        _FONT_SCALE, bg_colour, _FONT_THICKNESS + 2,
+            cv2.putText(target, label, (text_x, text_y), _FONT,
+                        font_scale, bg_colour, _FONT_THICKNESS + 1,
                         cv2.LINE_AA)
-            cv2.putText(strip, label, (text_x, text_y), _FONT,
-                        _FONT_SCALE, label_colour, _FONT_THICKNESS,
+            cv2.putText(target, label, (text_x, text_y), _FONT,
+                        font_scale, label_colour, _FONT_THICKNESS,
                         cv2.LINE_AA)
-
-    return strip
 
 
 def composite_frame(frame, strip, mode, overlay_alpha=0.6):
@@ -501,7 +545,7 @@ def annotate_video(args):
         if not os.path.isfile(args.spk2spk):
             raise FileNotFoundError(
                 "spk2spk file not found: {}".format(args.spk2spk))
-        display_names = read_spk2spk(args.spk2spk)
+        display_names = dict(read_scp(args.spk2spk))
 
     # Colour palette and strip theme
     colours = [hex_to_bgr(c) for c in _DEFAULT_COLOURS]
@@ -523,6 +567,62 @@ def annotate_video(args):
 
     logger.info("Video: %dx%d @ %.2f fps, %d frames",
                 frame_width, frame_height, fps, total_frames)
+
+    font_scale = compute_font_scale(frame_height)
+
+    # Load face landmarks if provided
+    face_landmarks = None
+    face2spk = None
+    spk2face = None
+    if args.faces is not None:
+        if not os.path.isfile(args.faces):
+            raise FileNotFoundError(
+                "Faces CSV not found: {}".format(args.faces))
+
+        face_colors = None
+        face_labels = None
+        if args.face2spk is not None:
+            if not os.path.isfile(args.face2spk):
+                raise FileNotFoundError(
+                    "face2spk file not found: {}".format(args.face2spk))
+            face2spk = dict(read_scp(args.face2spk))
+            spk2face = {spk: fi for fi, spk in face2spk.items()}
+            face_colors = {}
+            face_labels = {}
+            for face_idx_str, spk in face2spk.items():
+                if spk in spk_to_track:
+                    track = spk_to_track[spk]
+                    face_colors[face_idx_str] = colours[
+                        track % len(colours)]
+                label = spk
+                if display_names and spk in display_names:
+                    label = display_names[spk]
+                face_labels[face_idx_str] = label
+
+            # Warn about unmapped speakers
+            mapped_spks = set(face2spk.values())
+            for spk in all_speakers:
+                if spk not in mapped_spks:
+                    logger.warning(
+                        "Speaker '%s' in RTTM has no face mapping", spk)
+
+        face_scale = None
+        if args.faces_orig_size is not None:
+            orig_w, orig_h = [int(x) for x in
+                              args.faces_orig_size.split('x')]
+            face_scale = (frame_width / orig_w, frame_height / orig_h)
+
+        face_landmarks = FaceLandmarks(
+            args.faces, fps, frame_height, frame_width,
+            face_colors=face_colors, face_labels=face_labels,
+            font_scale=0.8*font_scale, scale=face_scale)
+
+        # Warn about unmapped faces
+        if face2spk is not None:
+            for fi in face_landmarks.face_indices:
+                if fi not in face2spk:
+                    logger.warning(
+                        "Face %s in CSV has no speaker mapping", fi)
 
     # Determine strip dimensions
     if args.mode == 'overlay':
@@ -567,6 +667,18 @@ def annotate_video(args):
         if not ret:
             break
 
+        if face_landmarks is not None:
+            active_faces = None
+            if spk2face is not None:
+                timestamp = frame_idx / fps
+                active_spks = set(
+                    spk for start, end, spk in hyp_segments
+                    if start <= timestamp < end)
+                active_faces = set(
+                    spk2face[spk] for spk in active_spks
+                    if spk in spk2face)
+            face_landmarks.draw_bboxes(frame, frame_idx, active_faces)
+
         timestamp = frame_idx / fps
 
         strip = render_diarization_strip(
@@ -585,10 +697,17 @@ def annotate_video(args):
             ref_style=args.ref_style,
             show_overlap=args.show_overlap,
             theme=theme,
+            font_scale=font_scale,
         )
 
         output_frame = composite_frame(frame, strip, args.mode,
                                        args.overlay_alpha)
+        strip_y_offset = output_frame.shape[0] - strip_height
+        draw_strip_overlays(
+            output_frame, strip_y_offset, strip_width, strip_height,
+            args.cursor_position, all_speakers, spk_to_track,
+            display_names=display_names, font_scale=font_scale,
+            theme=theme)
         writer.write(output_frame)
 
     cap.release()
@@ -605,7 +724,8 @@ def annotate_video(args):
     # Mux
     logger.info("Muxing audio and video...")
     mux_audio_video(tmp_video, audio_path, args.output,
-                    audio_offset=args.audio_offset)
+                    audio_offset=args.audio_offset,
+                    reencode=args.reencode)
     logger.info("Output written: %s", args.output)
 
     # Cleanup
