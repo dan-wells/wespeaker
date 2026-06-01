@@ -126,6 +126,13 @@ def get_args():
     parser.add_argument('--faces-orig-size', default=None,
                         help='Original video resolution as WxH (e.g. '
                              '1920x1080) for rescaling face coordinates')
+    parser.add_argument('--faces-buffer', type=float, default=5.0,
+                        help='Temporal buffer duration in seconds for '
+                             'filtering spurious face detections (0 to '
+                             'disable)')
+    parser.add_argument('--faces-min-presence', type=float, default=0.5,
+                        help='Minimum fraction of buffer frames a face '
+                             'must appear in to be displayed')
     parser.add_argument('--face2spk', default=None,
                         help='Face-to-speaker mapping file '
                              '(lines: face_idx speaker_label)')
@@ -615,7 +622,9 @@ def annotate_video(args):
         face_landmarks = FaceLandmarks(
             args.faces, fps, frame_height, frame_width,
             face_colors=face_colors, face_labels=face_labels,
-            font_scale=0.8*font_scale, scale=face_scale)
+            font_scale=0.8*font_scale, scale=face_scale,
+            buffer_duration=args.faces_buffer,
+            min_presence=args.faces_min_presence)
 
         # Warn about unmapped faces
         if face2spk is not None:

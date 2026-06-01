@@ -62,11 +62,18 @@ class FaceLandmarks(object):
         font_scale: Font scale for label text. If None, defaults to 0.5.
         scale: Optional (sx, sy) tuple to rescale CSV coordinates. Used
             when the video has been resized from the original resolution.
+        buffer_duration: Duration in seconds of the temporal buffer for
+            filtering spurious detections. 0 disables filtering.
+        min_presence: Minimum fraction of buffer frames a face must
+            appear in to be displayed.
+        causal: If True, buffer looks backward from current frame. If
+            False, buffer is centered on the current frame.
     """
 
     def __init__(self, csv_path, fps, frame_height, frame_width,
                  padding_ratio=0.35, line_width=2, face_colors=None,
-                 face_labels=None, font_scale=None, scale=None):
+                 face_labels=None, font_scale=None, scale=None,
+                 buffer_duration=5.0, min_presence=0.5, causal=True):
         self._fps = fps
         self._frame_height = frame_height
         self._frame_width = frame_width
@@ -76,6 +83,9 @@ class FaceLandmarks(object):
         self._face_labels = face_labels
         self._font_scale = font_scale if font_scale is not None else 0.5
         self._scale = scale
+        self._buffer_frames = int(round(buffer_duration * fps))
+        self._min_presence = min_presence
+        self._causal = causal
         self._data = {}
         self._load_csv(csv_path)
 
@@ -118,6 +128,14 @@ class FaceLandmarks(object):
 
         self._face_indices = set(
             str(fi) for faces in self._data.values() for fi in faces.keys())
+
+        self._presence = {}
+        for frame_idx, faces in self._data.items():
+            for face_idx in faces:
+                if face_idx not in self._presence:
+                    self._presence[face_idx] = set()
+                self._presence[face_idx].add(frame_idx)
+
         n_frames = len(self._data)
         logger.info("Loaded face landmarks: %d frames, %d unique faces",
                     n_frames, len(self._face_indices))
@@ -126,6 +144,22 @@ class FaceLandmarks(object):
     def face_indices(self):
         """Set of face index strings present in the loaded CSV."""
         return self._face_indices
+
+    def _is_face_visible(self, face_idx, frame_idx):
+        """Check if a face has sufficient presence in the buffer window."""
+        if self._buffer_frames == 0:
+            return True
+        if self._causal:
+            win_start = max(0, frame_idx - self._buffer_frames + 1)
+            win_end = frame_idx
+        else:
+            half = self._buffer_frames // 2
+            win_start = max(0, frame_idx - half)
+            win_end = frame_idx + (self._buffer_frames - half - 1)
+        window_size = win_end - win_start + 1
+        presence = self._presence.get(face_idx, set())
+        count = len(presence & set(range(win_start, win_end + 1)))
+        return count >= self._min_presence * window_size
 
     def get_bboxes(self, frame_idx):
         """Get face bounding boxes for a given frame.
@@ -143,6 +177,9 @@ class FaceLandmarks(object):
 
         bboxes = []
         for face_idx, points in faces.items():
+            if not self._is_face_visible(face_idx, frame_idx):
+                continue
+
             x_min = float(points[:, 0].min())
             x_max = float(points[:, 0].max())
             y_min = float(points[:, 1].min())
