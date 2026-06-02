@@ -133,6 +133,14 @@ def get_args():
     parser.add_argument('--faces-min-presence', type=float, default=0.5,
                         help='Minimum fraction of buffer frames a face '
                              'must appear in to be displayed')
+    parser.add_argument('--faces-active-only', action='store_true',
+                        help='Only draw face bounding boxes for active '
+                             'speakers (hides inactive faces entirely)')
+    parser.add_argument('--faces-enrol-threshold', type=float, default=None,
+                        help='Cumulative speech duration (seconds) before a '
+                             'speaker is considered enrolled. Until enrolled, '
+                             'active faces are drawn transparently. '
+                             '(default: disabled)')
     parser.add_argument('--face2spk', default=None,
                         help='Face-to-speaker mapping file '
                              '(lines: face_idx speaker_label)')
@@ -670,6 +678,22 @@ def annotate_video(args):
         raise RuntimeError(
             "Cannot open video writer with codec '{}'".format(args.codec))
 
+    # Precompute enrolment threshold crossings per speaker
+    enrol_threshold = args.faces_enrol_threshold
+    enrol_frame = {}
+    if enrol_threshold is not None and enrol_threshold > 0:
+        spk_segments = {}
+        for start, end, spk in hyp_segments:
+            spk_segments.setdefault(spk, []).append((start, end))
+        for spk, segs in spk_segments.items():
+            cumulative = 0.0
+            for start, end in sorted(segs):
+                cumulative += end - start
+                if cumulative >= enrol_threshold:
+                    enrol_time = end - (cumulative - enrol_threshold)
+                    enrol_frame[spk] = int(enrol_time * fps)
+                    break
+
     for frame_idx in tqdm(range(total_frames), desc='Rendering',
                            unit='frame'):
         ret, frame = cap.read()
@@ -678,6 +702,7 @@ def annotate_video(args):
 
         if face_landmarks is not None:
             active_faces = None
+            enrolled_faces = None
             if spk2face is not None:
                 timestamp = frame_idx / fps
                 active_spks = set(
@@ -686,7 +711,15 @@ def annotate_video(args):
                 active_faces = set(
                     spk2face[spk] for spk in active_spks
                     if spk in spk2face)
-            face_landmarks.draw_bboxes(frame, frame_idx, active_faces)
+                if enrol_frame:
+                    enrolled_faces = set(
+                        spk2face[spk] for spk in all_speakers
+                        if spk in spk2face
+                        and spk in enrol_frame
+                        and frame_idx >= enrol_frame[spk])
+            face_landmarks.draw_bboxes(frame, frame_idx, active_faces,
+                                       hide_inactive=args.faces_active_only,
+                                       enrolled_faces=enrolled_faces)
 
         timestamp = frame_idx / fps
 

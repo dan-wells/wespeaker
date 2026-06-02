@@ -199,7 +199,8 @@ class FaceLandmarks(object):
 
         return bboxes
 
-    def draw_bboxes(self, frame, frame_idx, active_faces=None):
+    def draw_bboxes(self, frame, frame_idx, active_faces=None,
+                    hide_inactive=False, enrolled_faces=None):
         """Draw face bounding boxes on a video frame.
 
         Args:
@@ -208,7 +209,14 @@ class FaceLandmarks(object):
             active_faces: Optional set of face_idx strings that are
                 currently speaking. If None, all boxes are drawn at full
                 opacity. If provided, inactive/unmapped faces are drawn
-                with alpha transparency.
+                with alpha transparency (or hidden, if hide_inactive).
+            hide_inactive: If True and active_faces is provided, skip
+                inactive faces entirely instead of drawing them
+                transparently.
+            enrolled_faces: Optional set of face_idx strings that have
+                accumulated enough speech to be considered enrolled.
+                If provided, active faces not in this set are drawn
+                transparently rather than at full opacity.
 
         Returns:
             The frame (same reference, modified in place).
@@ -222,15 +230,22 @@ class FaceLandmarks(object):
             else:
                 color = (128, 128, 128)
 
-            is_active = (face_key in active_faces
-                         or active_faces is None)  # fall back to highlighting all
+            is_active = (active_faces is None
+                         or face_key in active_faces)
+
+            if not is_active and hide_inactive:
+                continue
+
+            is_enrolled = (enrolled_faces is None
+                           or face_key in enrolled_faces)
+            draw_solid = is_active and is_enrolled
 
             if self._face_labels and face_key in self._face_labels:
                 label = self._face_labels[face_key]
             else:
                 label = "Face {}".format(face_idx)
 
-            target = frame if is_active else frame.copy()
+            target = frame if draw_solid else frame.copy()
 
             cv2.rectangle(target, (x1, y1), (x2, y2), color,
                           self._line_width)
@@ -246,7 +261,7 @@ class FaceLandmarks(object):
                         cv2.FONT_HERSHEY_SIMPLEX, self._font_scale,
                         (0, 0, 0), 1, cv2.LINE_AA)
 
-            if not is_active:
+            if not draw_solid:
                 cv2.addWeighted(target, 0.35, frame, 0.65, 0, frame)
 
         return frame
