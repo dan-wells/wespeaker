@@ -135,8 +135,6 @@ python tools/enroll_speakers.py \
 
 Use `--max-enroll-utts N` to cap the number of utterances per speaker (randomly subsampled).
 
-**Important**: use the same embedding model for enrolment and diarization. Embeddings from different models are not compatible.
-
 ### Online Clustering (`--assign cluster`)
 
 Maintains running speaker centroids and assigns each window to the most similar centroid, or creates a new cluster if similarity is below threshold. No enrolment data is needed.
@@ -204,8 +202,14 @@ Confidence scores are the cosine similarities between each chunk and the enrolme
 
 ### RTTM (`--output-rttm`)
 
-Standard NIST RTTM format. Adjacent windows with the same label are
-merged into contiguous segments:
+Standard NIST RTTM format:
+
+```
+SPEAKER utt_id channel start_sec duration <NA> <NA> speaker_label <NA> <NA>
+```
+
+Adjacent windows with the same label are merged into contiguous segments.
+Example:
 
 ```
 SPEAKER meeting001 1 0.000 2.000 <NA> <NA> speaker_a <NA> <NA>
